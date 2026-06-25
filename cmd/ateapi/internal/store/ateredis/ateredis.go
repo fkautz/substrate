@@ -575,15 +575,33 @@ func (s *Persistence) AcquireLock(ctx context.Context, key string, value string,
 }
 
 func (s *Persistence) ReleaseLock(ctx context.Context, key string, value string) error {
-	var luaRelease = redis.NewScript(`
-		if redis.call("get", KEYS[1]) == ARGV[1] then
-			return redis.call("del", KEYS[1])
-		else
-			return 0
-		end
-	`)
-
-	_, err := luaRelease.Run(ctx, s.rdb, []string{key}, value).Result()
+	// Compare-and-delete via WATCH/MULTI -- the same optimistic-transaction
+	// primitive the rest of this store uses -- so the persistence layer needs no
+	// Lua. Delete the lock only if it still holds our token; if it changed or
+	// vanished under us (expired then re-acquired, or already released), leave it
+	// alone. Release is best-effort: the lock TTL is the safety net regardless.
+	err := s.rdb.Watch(ctx, func(tx *redis.Tx) error {
+		current, err := tx.Get(ctx, key).Result()
+		if errors.Is(err, redis.Nil) {
+			return nil // already gone
+		}
+		if err != nil {
+			return err
+		}
+		if current != value {
+			return nil // not our lock; do not touch it
+		}
+		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+			pipe.Del(ctx, key)
+			return nil
+		})
+		return err
+	}, key)
+	if errors.Is(err, redis.TxFailedErr) {
+		// The key changed between our read and the delete, so the delete did not
+		// run. That is the safe outcome: we never delete a lock we no longer own.
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("while releasing lock for %q with value %q: %w", key, value, err)
 	}
