@@ -18,7 +18,7 @@
   "coverage": {
     "default": "unit",
     "rules": [
-      {"class": "blackbox", "funcPrefixes": ["TestScenario", "TestSmoke"]}
+      {"class": "blackbox", "pathPrefixes": ["functional_test.go"]}
     ]
   },
   "matrix": {

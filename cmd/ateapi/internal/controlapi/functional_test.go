@@ -2177,3 +2177,414 @@ func assertGrpcError(t *testing.T, err error, wantCode codes.Code, wantMsg strin
 		t.Errorf("expected message %q, got %q", wantMsg, st.Message())
 	}
 }
+
+// Verifies: REQ-API-025
+func TestResumeActor_NotFound(t *testing.T) {
+	ns := namespaceForTest("ns-resume-notfound")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	_, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{ActorId: "ghost"})
+	assertGrpcError(t, err, codes.NotFound, "Actor ghost not found")
+}
+
+// Verifies: REQ-API-033
+func TestSuspendActor_NotFound(t *testing.T) {
+	ns := namespaceForTest("ns-suspend-notfound")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	_, err := tc.client.SuspendActor(context.Background(), &ateapipb.SuspendActorRequest{ActorId: "ghost"})
+	assertGrpcError(t, err, codes.NotFound, "Actor ghost not found")
+}
+
+// Verifies: REQ-API-038
+func TestPauseActor_NotFound(t *testing.T) {
+	ns := namespaceForTest("ns-pause-notfound")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	_, err := tc.client.PauseActor(context.Background(), &ateapipb.PauseActorRequest{ActorId: "ghost"})
+	assertGrpcError(t, err, codes.NotFound, "Actor ghost not found")
+}
+
+// Verifies: REQ-API-037
+func TestPauseActor_RequiresId(t *testing.T) {
+	ns := namespaceForTest("ns-pause-requiresid")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	_, err := tc.client.PauseActor(context.Background(), &ateapipb.PauseActorRequest{})
+	assertGrpcError(t, err, codes.InvalidArgument, "id is required")
+}
+
+// Verifies: REQ-API-034
+func TestSuspendActor_Idempotent(t *testing.T) {
+	ns := namespaceForTest("ns-suspend-idempotent")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+
+	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: ns, ActorTemplateName: "tmpl1", ActorId: "id1",
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{ActorId: "id1"}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	if _, err := tc.client.SuspendActor(context.Background(), &ateapipb.SuspendActorRequest{ActorId: "id1"}); err != nil {
+		t.Fatalf("first SuspendActor failed: %v", err)
+	}
+	// Second suspend on an already-suspended actor must succeed (idempotent).
+	if _, err := tc.client.SuspendActor(context.Background(), &ateapipb.SuspendActorRequest{ActorId: "id1"}); err != nil {
+		t.Fatalf("second SuspendActor (idempotent) failed: %v", err)
+	}
+	getResp, err := tc.client.GetActor(context.Background(), &ateapipb.GetActorRequest{ActorId: "id1"})
+	if err != nil {
+		t.Fatalf("GetActor failed: %v", err)
+	}
+	if got := getResp.GetActor().GetStatus(); got != ateapipb.Actor_STATUS_SUSPENDED {
+		t.Errorf("expected status SUSPENDED after repeated suspend, got %v", got)
+	}
+}
+
+// Verifies: REQ-API-039
+func TestPauseActor_Idempotent(t *testing.T) {
+	ns := namespaceForTest("ns-pause-idempotent")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+
+	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: ns, ActorTemplateName: "tmpl1", ActorId: "id1",
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{ActorId: "id1"}); err != nil {
+		t.Fatalf("ResumeActor failed: %v", err)
+	}
+	if _, err := tc.client.PauseActor(context.Background(), &ateapipb.PauseActorRequest{ActorId: "id1"}); err != nil {
+		t.Fatalf("first PauseActor failed: %v", err)
+	}
+	// Second pause on an already-paused actor must succeed (idempotent).
+	if _, err := tc.client.PauseActor(context.Background(), &ateapipb.PauseActorRequest{ActorId: "id1"}); err != nil {
+		t.Fatalf("second PauseActor (idempotent) failed: %v", err)
+	}
+	getResp, err := tc.client.GetActor(context.Background(), &ateapipb.GetActorRequest{ActorId: "id1"})
+	if err != nil {
+		t.Fatalf("GetActor failed: %v", err)
+	}
+	if got := getResp.GetActor().GetStatus(); got != ateapipb.Actor_STATUS_PAUSED {
+		t.Errorf("expected status PAUSED after repeated pause, got %v", got)
+	}
+}
+
+// Verifies: REQ-API-036
+func TestSuspendActor_LockConflict(t *testing.T) {
+	ns := namespaceForTest("ns-suspend-lock")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+
+	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: ns, ActorTemplateName: "tmpl1", ActorId: "id1",
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+
+	// Hold the per-actor lock with a slow resume, then race a suspend against it.
+	tc.fakeAtelet.RestoreDelay = 1 * time.Second
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{ActorId: "id1"})
+		errChan <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	_, err := tc.client.SuspendActor(context.Background(), &ateapipb.SuspendActorRequest{ActorId: "id1"})
+	assertGrpcError(t, err, codes.Aborted, "another operation is in progress for this actor")
+
+	if errA := <-errChan; errA != nil {
+		t.Fatalf("background ResumeActor failed: %v", errA)
+	}
+}
+
+// Verifies: REQ-API-041
+func TestPauseActor_LockConflict(t *testing.T) {
+	ns := namespaceForTest("ns-pause-lock")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+
+	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: ns, ActorTemplateName: "tmpl1", ActorId: "id1",
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+
+	tc.fakeAtelet.RestoreDelay = 1 * time.Second
+	errChan := make(chan error, 1)
+	go func() {
+		_, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{ActorId: "id1"})
+		errChan <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+
+	_, err := tc.client.PauseActor(context.Background(), &ateapipb.PauseActorRequest{ActorId: "id1"})
+	assertGrpcError(t, err, codes.Aborted, "another operation is in progress for this actor")
+
+	if errA := <-errChan; errA != nil {
+		t.Fatalf("background ResumeActor failed: %v", errA)
+	}
+}
+
+// Verifies: REQ-API-044
+func TestListActors_DefaultPageSize(t *testing.T) {
+	ns := namespaceForTest("ns-list-default-pagesize")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	for i := 0; i < 3; i++ {
+		if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+			ActorTemplateNamespace: ns, ActorTemplateName: "tmpl1", ActorId: fmt.Sprintf("id%d", i),
+		}); err != nil {
+			t.Fatalf("CreateActor %d failed: %v", i, err)
+		}
+	}
+
+	// PageSize 0 must default to the full page (1000), returning all actors at once.
+	listResp, err := tc.client.ListActors(context.Background(), &ateapipb.ListActorsRequest{PageSize: 0})
+	if err != nil {
+		t.Fatalf("ListActors failed: %v", err)
+	}
+	if len(listResp.GetActors()) != 3 {
+		t.Errorf("expected all 3 actors in one default-sized page, got %d", len(listResp.GetActors()))
+	}
+	if listResp.GetNextPageToken() != "" {
+		t.Errorf("expected no next page token with the default page size, got %q", listResp.GetNextPageToken())
+	}
+}
+
+// Verifies: REQ-API-047
+func TestDebugClear(t *testing.T) {
+	ns := namespaceForTest("ns-debug-clear")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+
+	createTemplate(t, tc, ns)
+	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: ns, ActorTemplateName: "tmpl1", ActorId: "id1",
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+
+	if _, err := tc.client.DebugClear(context.Background(), &ateapipb.DebugClearRequest{}); err != nil {
+		t.Fatalf("DebugClear failed: %v", err)
+	}
+
+	listResp, err := tc.client.ListActors(context.Background(), &ateapipb.ListActorsRequest{})
+	if err != nil {
+		t.Fatalf("ListActors failed: %v", err)
+	}
+	if len(listResp.GetActors()) != 0 {
+		t.Errorf("expected no actors after DebugClear, got %d", len(listResp.GetActors()))
+	}
+}
+
+// The following per-case validation tests split what TestValidation covers into
+// one tagged function per requirement, so each wire-observable validation
+// obligation has its own attributable black-box test.
+
+const (
+	selectorBadKeyMsg   = `invalid worker_selector label key "bad key!": name part must consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyName',  or 'my.name',  or '123-abc', regex used for validation is '([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9]')`
+	selectorBadValueMsg = `invalid worker_selector label value "not valid!" for key "tier": a valid label must be an empty string or consist of alphanumeric characters, '-', '_' or '.', and must start and end with an alphanumeric character (e.g. 'MyValue',  or 'my_value',  or '12345', regex used for validation is '(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])?')`
+	actorIDFormatMsg    = "invalid actor_id: must start and end with a lower case alphanumeric character, and consist only of lower case alphanumeric characters or '-'"
+)
+
+// Verifies: REQ-API-003
+func TestCreateActor_RequiresNamespace(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-create-ns"))
+	defer tc.cleanup()
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{ActorTemplateName: "tmpl1", ActorId: "id1"})
+	assertGrpcError(t, err, codes.InvalidArgument, "actor_template_namespace is required")
+}
+
+// Verifies: REQ-API-004
+func TestCreateActor_RequiresTemplateName(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-create-tmpl"))
+	defer tc.cleanup()
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{ActorTemplateNamespace: "ns1", ActorId: "id1"})
+	assertGrpcError(t, err, codes.InvalidArgument, "actor_template_name is required")
+}
+
+// Verifies: REQ-API-005
+func TestCreateActor_RequiresActorId(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-create-id"))
+	defer tc.cleanup()
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{ActorTemplateNamespace: "ns1", ActorTemplateName: "tmpl1"})
+	assertGrpcError(t, err, codes.InvalidArgument, "actor_id is required")
+}
+
+// Verifies: REQ-API-007
+func TestCreateActor_TooManySelectorLabels(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-create-count"))
+	defer tc.cleanup()
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: "ns1", ActorTemplateName: "tmpl1", ActorId: "id1",
+		WorkerSelector: &ateapipb.Selector{MatchLabels: selectorLabelsOfSize(11)},
+	})
+	assertGrpcError(t, err, codes.InvalidArgument, "worker_selector has 11 match_labels entries, exceeding the limit of 10")
+}
+
+// Verifies: REQ-API-008
+func TestCreateActor_InvalidSelectorKey(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-create-key"))
+	defer tc.cleanup()
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: "ns1", ActorTemplateName: "tmpl1", ActorId: "id1",
+		WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"bad key!": "x"}},
+	})
+	assertGrpcError(t, err, codes.InvalidArgument, selectorBadKeyMsg)
+}
+
+// Verifies: REQ-API-009
+func TestCreateActor_InvalidSelectorValue(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-create-value"))
+	defer tc.cleanup()
+	_, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: "ns1", ActorTemplateName: "tmpl1", ActorId: "id1",
+		WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"tier": "not valid!"}},
+	})
+	assertGrpcError(t, err, codes.InvalidArgument, selectorBadValueMsg)
+}
+
+// Verifies: REQ-API-001
+func TestGetActor_RequiresId(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-get-id"))
+	defer tc.cleanup()
+	_, err := tc.client.GetActor(context.Background(), &ateapipb.GetActorRequest{})
+	assertGrpcError(t, err, codes.InvalidArgument, "id is required")
+}
+
+// Verifies: REQ-API-024
+func TestResumeActor_RequiresId(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-resume-id"))
+	defer tc.cleanup()
+	_, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{})
+	assertGrpcError(t, err, codes.InvalidArgument, "id is required")
+}
+
+// Verifies: REQ-API-032
+func TestSuspendActor_RequiresId(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-suspend-id"))
+	defer tc.cleanup()
+	_, err := tc.client.SuspendActor(context.Background(), &ateapipb.SuspendActorRequest{})
+	assertGrpcError(t, err, codes.InvalidArgument, "id is required")
+}
+
+// Verifies: REQ-API-014
+func TestUpdateActor_RequiresId(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-update-id"))
+	defer tc.cleanup()
+	_, err := tc.client.UpdateActor(context.Background(), &ateapipb.UpdateActorRequest{})
+	assertGrpcError(t, err, codes.InvalidArgument, "actor_id is required")
+}
+
+// Verifies: REQ-API-015
+func TestUpdateActor_InvalidSelector(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-update-selector"))
+	defer tc.cleanup()
+	_, err := tc.client.UpdateActor(context.Background(), &ateapipb.UpdateActorRequest{
+		ActorId:        "id1",
+		WorkerSelector: &ateapipb.Selector{MatchLabels: map[string]string{"bad key!": "x"}},
+	})
+	assertGrpcError(t, err, codes.InvalidArgument, selectorBadKeyMsg)
+}
+
+// Verifies: REQ-API-019
+func TestDeleteActor_RequiresId(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-delete-id"))
+	defer tc.cleanup()
+	_, err := tc.client.DeleteActor(context.Background(), &ateapipb.DeleteActorRequest{})
+	assertGrpcError(t, err, codes.InvalidArgument, "actor_id is required")
+}
+
+// Verifies: REQ-API-020
+func TestDeleteActor_InvalidActorId(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-val-delete-format"))
+	defer tc.cleanup()
+	_, err := tc.client.DeleteActor(context.Background(), &ateapipb.DeleteActorRequest{ActorId: "ID1"})
+	assertGrpcError(t, err, codes.InvalidArgument, actorIDFormatMsg)
+}
+
+// Verifies: REQ-API-013
+func TestCreateActor_InitialVersion(t *testing.T) {
+	ns := namespaceForTest("ns-create-version")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+	createTemplate(t, tc, ns)
+	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: ns, ActorTemplateName: "tmpl1", ActorId: "id1",
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	getResp, err := tc.client.GetActor(context.Background(), &ateapipb.GetActorRequest{ActorId: "id1"})
+	if err != nil {
+		t.Fatalf("GetActor failed: %v", err)
+	}
+	if v := getResp.GetActor().GetVersion(); v != 1 {
+		t.Errorf("expected initial version 1, got %d", v)
+	}
+}
+
+// Verifies: REQ-API-026
+func TestResumeActor_Idempotent(t *testing.T) {
+	ns := namespaceForTest("ns-resume-idempotent")
+	tc := setupTest(t, ns)
+	defer tc.cleanup()
+	createTemplate(t, tc, ns)
+	createWorkerPod(t, tc, ns, "worker-1", "node1", "pool1")
+	if _, err := tc.client.CreateActor(context.Background(), &ateapipb.CreateActorRequest{
+		ActorTemplateNamespace: ns, ActorTemplateName: "tmpl1", ActorId: "id1",
+	}); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{ActorId: "id1"}); err != nil {
+		t.Fatalf("first ResumeActor failed: %v", err)
+	}
+	// Second resume on an already-running actor must succeed (idempotent).
+	if _, err := tc.client.ResumeActor(context.Background(), &ateapipb.ResumeActorRequest{ActorId: "id1"}); err != nil {
+		t.Fatalf("second ResumeActor (idempotent) failed: %v", err)
+	}
+	getResp, err := tc.client.GetActor(context.Background(), &ateapipb.GetActorRequest{ActorId: "id1"})
+	if err != nil {
+		t.Fatalf("GetActor failed: %v", err)
+	}
+	if got := getResp.GetActor().GetStatus(); got != ateapipb.Actor_STATUS_RUNNING {
+		t.Errorf("expected status RUNNING after repeated resume, got %v", got)
+	}
+}
+
+// Verifies: REQ-API-042
+func TestListActors_RejectsNegativePageSize(t *testing.T) {
+	tc := setupTest(t, namespaceForTest("ns-list-negative-pagesize"))
+	defer tc.cleanup()
+	_, err := tc.client.ListActors(context.Background(), &ateapipb.ListActorsRequest{PageSize: -1})
+	if err == nil {
+		t.Fatalf("expected ListActors to reject a negative page_size")
+	}
+	st, _ := status.FromError(err)
+	if st.Code() != codes.InvalidArgument {
+		t.Errorf("expected InvalidArgument for negative page_size, got %v", st.Code())
+	}
+}
