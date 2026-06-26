@@ -149,6 +149,7 @@ func assertKeysAbsent(ctx context.Context, t *testing.T, s *Persistence, keys ..
 // TestClusterActorRoundTrip writes an Actor through the store and reads it back
 // from a real cluster, then confirms the stored value is binary protobuf (not
 // protojson).
+// Verifies: REQ-ATEREDIS-001
 func TestClusterActorRoundTrip(t *testing.T) {
 	s, ctx := setupClusterTest(t)
 
@@ -209,6 +210,7 @@ func TestClusterActorRoundTrip(t *testing.T) {
 
 // TestClusterWorkerRoundTrip writes a Worker through the store and reads it back
 // from a real cluster, then confirms the stored value is binary protobuf.
+// Verifies: REQ-ATEREDIS-002
 func TestClusterWorkerRoundTrip(t *testing.T) {
 	s, ctx := setupClusterTest(t)
 
@@ -264,6 +266,7 @@ func TestClusterWorkerRoundTrip(t *testing.T) {
 // TestClusterListRoundTrip exercises the list decode paths (fetchActors via
 // ListActors, and ListWorkers) against a real cluster under binary encoding,
 // comparing the listed records as sets against the exact expected protobufs.
+// Verifies: REQ-ATEREDIS-003
 func TestClusterListRoundTrip(t *testing.T) {
 	s, ctx := setupClusterTest(t)
 
@@ -335,6 +338,7 @@ func TestClusterListRoundTrip(t *testing.T) {
 // a valid encoding of a zero message under proto.Unmarshal, so the key identity
 // checks must catch them; a valid protobuf stored under the wrong key must be
 // caught the same way.
+// Verifies: REQ-ATEREDIS-004
 func TestClusterCorruptValues(t *testing.T) {
 	t.Run("garbage actor value fails GetActor", func(t *testing.T) {
 		s, ctx := setupClusterTest(t)
@@ -422,6 +426,7 @@ func TestClusterCorruptValues(t *testing.T) {
 // encoding switch, including a token carrying an embedded NUL byte. The
 // release Lua compares the opaque token by byte equality and never touches the
 // record encoding.
+// Verifies: REQ-ATEREDIS-006
 func TestClusterLockBinarySafe(t *testing.T) {
 	s, ctx := setupClusterTest(t)
 

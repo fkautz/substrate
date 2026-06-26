@@ -58,6 +58,7 @@ func TestGetActor_NotFound(t *testing.T) {
 // TestCreateActor_StoresBinaryProtobuf locks in the binary-protobuf encoding so
 // an accidental revert to protojson (which would still round-trip and pass the
 // other tests) is caught: protojson values start with '{', binary ones do not.
+// Verifies: REQ-ATEREDIS-001
 func TestCreateActor_StoresBinaryProtobuf(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -85,6 +86,7 @@ func TestCreateActor_StoresBinaryProtobuf(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-ATEREDIS-002
 func TestCreateWorker_StoresBinaryProtobuf(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -109,6 +111,7 @@ func TestCreateWorker_StoresBinaryProtobuf(t *testing.T) {
 
 // TestGetActor_CorruptValue ensures a non-protobuf value fails to decode rather
 // than being silently accepted.
+// Verifies: REQ-ATEREDIS-005
 func TestGetActor_CorruptValue(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -124,6 +127,7 @@ func TestGetActor_CorruptValue(t *testing.T) {
 // TestGetActor_EmptyValueRejected covers the binary-encoding pitfall: an empty
 // value decodes to a zero-valued message under proto.Unmarshal without error,
 // so the key-identity check must reject it.
+// Verifies: REQ-ATEREDIS-004
 func TestGetActor_EmptyValueRejected(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -136,6 +140,7 @@ func TestGetActor_EmptyValueRejected(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-ATEREDIS-004
 func TestGetWorker_EmptyValueRejected(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -150,6 +155,7 @@ func TestGetWorker_EmptyValueRejected(t *testing.T) {
 
 // TestListActors_RejectsIdentityMismatch exercises the identity validation added
 // to fetchActors: a valid Actor stored under the wrong key must be rejected.
+// Verifies: REQ-ATEREDIS-004
 func TestListActors_RejectsIdentityMismatch(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -168,6 +174,7 @@ func TestListActors_RejectsIdentityMismatch(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-ATEREDIS-004
 func TestListActors_RejectsEmptyValue(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -182,6 +189,7 @@ func TestListActors_RejectsEmptyValue(t *testing.T) {
 
 // TestListWorkers_RejectsIdentityMismatch exercises the identity validation added
 // to ListWorkers: a valid Worker stored under the wrong key must be rejected.
+// Verifies: REQ-ATEREDIS-004
 func TestListWorkers_RejectsIdentityMismatch(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -200,6 +208,7 @@ func TestListWorkers_RejectsIdentityMismatch(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-ATEREDIS-004
 func TestListWorkers_RejectsEmptyValue(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -303,6 +312,7 @@ func TestUpdateActor_Success(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-ATEREDIS-007
 func TestUpdateActor_Conflict(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -593,6 +603,7 @@ func TestListWorkers(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-ATEREDIS-003
 func TestListActors(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()
@@ -891,6 +902,7 @@ func TestReleaseLock_Success(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-ATEREDIS-006
 func TestReleaseLock_Unsafe(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()

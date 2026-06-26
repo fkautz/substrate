@@ -1,0 +1,30 @@
+{
+  "idGrammar": {
+    "pattern": "REQ-ATEREDIS-\\d{3}",
+    "headingPrefix": "REQ-ATEREDIS-",
+    "seriesPattern": "^REQ-(ATEREDIS)-"
+  },
+  "catalog": {
+    "sectionField": "Section",
+    "keywordField": "Keyword",
+    "sectionRefPattern": ""
+  },
+  "tag": {
+    "keyword": "Verifies:",
+    "collectors": [
+      {"lang": "go", "funcPrefixes": ["Test", "Fuzz", "Example"]}
+    ]
+  },
+  "coverage": {
+    "default": "unit",
+    "rules": [
+      {"class": "blackbox", "funcPrefixes": ["TestCluster"]}
+    ]
+  },
+  "matrix": {
+    "generatedBy": "`trace-check` (ateredis traceability gate)",
+    "primaryLabel": "Unit coverage",
+    "secondaryLabel": "Real-cluster coverage"
+  },
+  "skipDirs": [".git", "testdata", "docs", "spec", "node_modules"]
+}
