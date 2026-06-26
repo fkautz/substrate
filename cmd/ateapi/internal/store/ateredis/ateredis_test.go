@@ -55,6 +55,163 @@ func TestGetActor_NotFound(t *testing.T) {
 	}
 }
 
+// TestCreateActor_StoresBinaryProtobuf locks in the binary-protobuf encoding so
+// an accidental revert to protojson (which would still round-trip and pass the
+// other tests) is caught: protojson values start with '{', binary ones do not.
+func TestCreateActor_StoresBinaryProtobuf(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	actor := &ateapipb.Actor{
+		ActorId:                "session-1",
+		ActorTemplateNamespace: "default",
+		ActorTemplateName:      "test-template",
+		Status:                 ateapipb.Actor_STATUS_SUSPENDED,
+	}
+	if err := s.CreateActor(ctx, actor); err != nil {
+		t.Fatalf("CreateActor failed: %v", err)
+	}
+
+	raw, err := s.rdb.Get(ctx, actorDBKey(actor.ActorId)).Bytes()
+	if err != nil {
+		t.Fatalf("raw Get failed: %v", err)
+	}
+	if len(raw) > 0 && raw[0] == '{' {
+		t.Errorf("stored actor value looks like JSON, expected binary protobuf: %q", raw)
+	}
+	decoded := &ateapipb.Actor{}
+	if err := proto.Unmarshal(raw, decoded); err != nil {
+		t.Errorf("stored actor value is not valid binary protobuf: %v", err)
+	}
+}
+
+func TestCreateWorker_StoresBinaryProtobuf(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	worker := &ateapipb.Worker{WorkerNamespace: "default", WorkerPool: "pool-1", WorkerPod: "pod-1"}
+	if err := s.CreateWorker(ctx, worker); err != nil {
+		t.Fatalf("CreateWorker failed: %v", err)
+	}
+
+	raw, err := s.rdb.Get(ctx, workerDBKey("default", "pool-1", "pod-1")).Bytes()
+	if err != nil {
+		t.Fatalf("raw Get failed: %v", err)
+	}
+	if len(raw) > 0 && raw[0] == '{' {
+		t.Errorf("stored worker value looks like JSON, expected binary protobuf: %q", raw)
+	}
+	decoded := &ateapipb.Worker{}
+	if err := proto.Unmarshal(raw, decoded); err != nil {
+		t.Errorf("stored worker value is not valid binary protobuf: %v", err)
+	}
+}
+
+// TestGetActor_CorruptValue ensures a non-protobuf value fails to decode rather
+// than being silently accepted.
+func TestGetActor_CorruptValue(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	if err := s.rdb.Set(ctx, actorDBKey("garbage"), "not-a-protobuf-\xff\xfe", 0).Err(); err != nil {
+		t.Fatalf("seeding garbage value failed: %v", err)
+	}
+	if _, err := s.GetActor(ctx, "garbage"); err == nil {
+		t.Errorf("expected GetActor to fail on a non-protobuf value, got nil")
+	}
+}
+
+// TestGetActor_EmptyValueRejected covers the binary-encoding pitfall: an empty
+// value decodes to a zero-valued message under proto.Unmarshal without error,
+// so the key-identity check must reject it.
+func TestGetActor_EmptyValueRejected(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	if err := s.rdb.Set(ctx, actorDBKey("ghost"), "", 0).Err(); err != nil {
+		t.Fatalf("seeding empty value failed: %v", err)
+	}
+	if _, err := s.GetActor(ctx, "ghost"); err == nil {
+		t.Errorf("expected GetActor to reject an empty value, got nil")
+	}
+}
+
+func TestGetWorker_EmptyValueRejected(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	if err := s.rdb.Set(ctx, workerDBKey("ns1", "pool1", "ghost"), "", 0).Err(); err != nil {
+		t.Fatalf("seeding empty value failed: %v", err)
+	}
+	if _, err := s.GetWorker(ctx, "ns1", "pool1", "ghost"); err == nil {
+		t.Errorf("expected GetWorker to reject an empty value, got nil")
+	}
+}
+
+// TestListActors_RejectsIdentityMismatch exercises the identity validation added
+// to fetchActors: a valid Actor stored under the wrong key must be rejected.
+func TestListActors_RejectsIdentityMismatch(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	bytes, err := proto.Marshal(&ateapipb.Actor{
+		ActorId: "real", ActorTemplateNamespace: "ns1", ActorTemplateName: "tmpl1", Version: 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if err := s.rdb.Set(ctx, actorDBKey("wrong"), bytes, 0).Err(); err != nil {
+		t.Fatalf("seeding mismatched actor failed: %v", err)
+	}
+	if _, _, err := s.ListActors(ctx, 1000, ""); err == nil {
+		t.Errorf("expected ListActors to reject the identity-mismatched actor, got nil")
+	}
+}
+
+func TestListActors_RejectsEmptyValue(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	if err := s.rdb.Set(ctx, actorDBKey("ghost"), "", 0).Err(); err != nil {
+		t.Fatalf("seeding empty value failed: %v", err)
+	}
+	if _, _, err := s.ListActors(ctx, 1000, ""); err == nil {
+		t.Errorf("expected ListActors to reject the empty-value actor key, got nil")
+	}
+}
+
+// TestListWorkers_RejectsIdentityMismatch exercises the identity validation added
+// to ListWorkers: a valid Worker stored under the wrong key must be rejected.
+func TestListWorkers_RejectsIdentityMismatch(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	bytes, err := proto.Marshal(&ateapipb.Worker{
+		WorkerNamespace: "ns1", WorkerPool: "pool1", WorkerPod: "real", Version: 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal failed: %v", err)
+	}
+	if err := s.rdb.Set(ctx, workerDBKey("ns1", "pool1", "wrong"), bytes, 0).Err(); err != nil {
+		t.Fatalf("seeding mismatched worker failed: %v", err)
+	}
+	if _, err := s.ListWorkers(ctx); err == nil {
+		t.Errorf("expected ListWorkers to reject the identity-mismatched worker, got nil")
+	}
+}
+
+func TestListWorkers_RejectsEmptyValue(t *testing.T) {
+	mr, s, ctx := setupTest(t)
+	defer mr.Close()
+
+	if err := s.rdb.Set(ctx, workerDBKey("ns1", "pool1", "ghost"), "", 0).Err(); err != nil {
+		t.Fatalf("seeding empty value failed: %v", err)
+	}
+	if _, err := s.ListWorkers(ctx); err == nil {
+		t.Errorf("expected ListWorkers to reject the empty-value worker key, got nil")
+	}
+}
+
 func TestCreateActor_Success(t *testing.T) {
 	mr, s, ctx := setupTest(t)
 	defer mr.Close()

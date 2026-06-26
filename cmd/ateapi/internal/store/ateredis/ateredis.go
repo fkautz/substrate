@@ -15,12 +15,14 @@
 // Package ateredis is an ate storage backend built on Redis.
 //
 // Actors are stored in keys of the form
-// `actor:<actor-id>`.  They are
-// stored as DBActor JSON-serialized objects, which lets us manipulate them from
-// Redis lua.
+// `actor:<actor-id>`.  They are stored as binary protobuf-serialized Actor
+// records. Binary protobuf roughly halves per-record memory versus protojson
+// and is ~4x faster to encode; the optimistic-concurrency version check stays
+// in Go, so the encoding is never inspected from Redis lua.
 //
 // Workers are stored in keys of the form
-// `worker:<namespace>:<pool-name>:<pod-name>`, holding a DBWorker JSON object.
+// `worker:<namespace>:<pool-name>:<pod-name>`, holding a binary
+// protobuf-serialized Worker record.
 //
 // Note that redis lua scripting has a restriction that informed the data design
 // here -- a lua script must predeclare all keys it is going to access.  It
@@ -60,6 +62,11 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// workerPubSubMsg is the payload of a transient worker-change notification on
+// the pub/sub channel. It intentionally stays on protojson: only the resident
+// Actor/Worker *records* in the keyspace were moved to binary protobuf (those
+// are what dominate RAM at scale). These ephemeral events are never persisted,
+// so their encoding is out of scope for the record-encoding cutover.
 type workerPubSubMsg struct {
 	Type   int    `json:"t"`
 	Worker string `json:"w"` // protojson-encoded Worker
@@ -191,7 +198,7 @@ func (s *Persistence) GetActor(ctx context.Context, id string) (*ateapipb.Actor,
 	}
 
 	actor := &ateapipb.Actor{}
-	if err := protojson.Unmarshal(dbActorBytes, actor); err != nil {
+	if err := proto.Unmarshal(dbActorBytes, actor); err != nil {
 		return nil, fmt.Errorf("while unmarshaling actor: %w", err)
 	}
 
@@ -210,9 +217,9 @@ func (s *Persistence) CreateActor(ctx context.Context, actor *ateapipb.Actor) er
 	dbActor := proto.Clone(actor).(*ateapipb.Actor)
 	dbActor.Version = 1
 
-	dbActorBytes, err := protojson.Marshal(dbActor)
+	dbActorBytes, err := proto.Marshal(dbActor)
 	if err != nil {
-		return fmt.Errorf("in protojson.Marshal: %w", err)
+		return fmt.Errorf("in proto.Marshal: %w", err)
 	}
 
 	ok, err := s.rdb.SetNX(ctx, dbKey, dbActorBytes, 0).Result()
@@ -234,9 +241,9 @@ func (s *Persistence) CreateWorker(ctx context.Context, worker *ateapipb.Worker)
 	dbWorker := proto.Clone(worker).(*ateapipb.Worker)
 	dbWorker.Version = 1
 
-	dbWorkerBytes, err := protojson.Marshal(dbWorker)
+	dbWorkerBytes, err := proto.Marshal(dbWorker)
 	if err != nil {
-		return fmt.Errorf("in protojson.Marshal: %w", err)
+		return fmt.Errorf("in proto.Marshal: %w", err)
 	}
 
 	ok, err := s.rdb.SetNX(ctx, dbKey, dbWorkerBytes, 0).Result()
@@ -263,8 +270,8 @@ func (s *Persistence) GetWorker(ctx context.Context, namespace, pool, pod string
 	}
 
 	worker := &ateapipb.Worker{}
-	if err := protojson.Unmarshal(dbWorkerBytes, worker); err != nil {
-		return nil, fmt.Errorf("in protojson.Unmarshal: %w", err)
+	if err := proto.Unmarshal(dbWorkerBytes, worker); err != nil {
+		return nil, fmt.Errorf("in proto.Unmarshal: %w", err)
 	}
 
 	if worker.GetWorkerNamespace() != namespace || worker.GetWorkerPool() != pool || worker.GetWorkerPod() != pod {
@@ -291,8 +298,8 @@ func (s *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 		}
 
 		currentWorker := &ateapipb.Worker{}
-		if err := protojson.Unmarshal(currentVal, currentWorker); err != nil {
-			return fmt.Errorf("in protojson.Unmarshal: %w", err)
+		if err := proto.Unmarshal(currentVal, currentWorker); err != nil {
+			return fmt.Errorf("in proto.Unmarshal: %w", err)
 		}
 
 		if currentWorker.GetVersion() != expectedVersion {
@@ -312,9 +319,9 @@ func (s *Persistence) UpdateWorker(ctx context.Context, worker *ateapipb.Worker,
 			return fmt.Errorf("ip is immutable")
 		}
 
-		newVal, err := protojson.Marshal(dbWorker)
+		newVal, err := proto.Marshal(dbWorker)
 		if err != nil {
-			return fmt.Errorf("in protojson.Marshal: %w", err)
+			return fmt.Errorf("in proto.Marshal: %w", err)
 		}
 
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
@@ -359,8 +366,8 @@ func (s *Persistence) DeleteActor(ctx context.Context, id string) error {
 		}
 
 		currentActor := &ateapipb.Actor{}
-		if err := protojson.Unmarshal(currentVal, currentActor); err != nil {
-			return fmt.Errorf("in protojson.Unmarshal: %w", err)
+		if err := proto.Unmarshal(currentVal, currentActor); err != nil {
+			return fmt.Errorf("in proto.Unmarshal: %w", err)
 		}
 
 		if currentActor.GetStatus() != ateapipb.Actor_STATUS_SUSPENDED {
@@ -401,8 +408,8 @@ func (s *Persistence) UpdateActor(ctx context.Context, actor *ateapipb.Actor, ex
 		}
 
 		currentActor := &ateapipb.Actor{}
-		if err := protojson.Unmarshal(currentVal, currentActor); err != nil {
-			return fmt.Errorf("in protojson.Unmarshal: %w", err)
+		if err := proto.Unmarshal(currentVal, currentActor); err != nil {
+			return fmt.Errorf("in proto.Unmarshal: %w", err)
 		}
 
 		if currentActor.GetVersion() != expectedVersion {
@@ -419,9 +426,9 @@ func (s *Persistence) UpdateActor(ctx context.Context, actor *ateapipb.Actor, ex
 			return fmt.Errorf("actor_template_name is immutable")
 		}
 
-		newVal, err := protojson.Marshal(dbActor)
+		newVal, err := proto.Marshal(dbActor)
 		if err != nil {
-			return fmt.Errorf("in protojson.Marshal: %w", err)
+			return fmt.Errorf("in proto.Marshal: %w", err)
 		}
 
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
@@ -462,8 +469,16 @@ func (s *Persistence) ListWorkers(ctx context.Context) ([]*ateapipb.Worker, erro
 			}
 
 			worker := &ateapipb.Worker{}
-			if err := protojson.Unmarshal([]byte(getCmd.Val()), worker); err != nil {
-				return fmt.Errorf("in protojson.Unmarshal: %w", err)
+			if err := proto.Unmarshal([]byte(getCmd.Val()), worker); err != nil {
+				return fmt.Errorf("in proto.Unmarshal: %w", err)
+			}
+
+			// Validate the decoded identity against the key. An empty value
+			// decodes to a zero-valued message under proto.Unmarshal without
+			// error, so this guards against corrupt/empty keys silently
+			// surfacing as blank workers (GetWorker performs the same check).
+			if worker.GetWorkerNamespace() != parts[1] || worker.GetWorkerPool() != parts[2] || worker.GetWorkerPod() != parts[3] {
+				return fmt.Errorf("worker record at key %q does not match its key identity", workerKey)
 			}
 
 			mu.Lock()
@@ -628,22 +643,37 @@ func (s *Persistence) fetchActors(ctx context.Context, master *redis.Client, key
 		return nil, fmt.Errorf("while fetching keys in shard %s: %w", master.Options().Addr, err)
 	}
 
+	// Pipelined returns one result per queued command, in order, so cmds[i]
+	// corresponds to keys[i]. We rely on that to validate each decoded record
+	// against its key below; fail closed if that invariant ever breaks.
+	if len(cmds) != len(keys) {
+		return nil, fmt.Errorf("(impossible) pipeline returned %d results for %d keys in shard %s", len(cmds), len(keys), master.Options().Addr)
+	}
+
 	var actors []*ateapipb.Actor
-	for _, cmd := range cmds {
+	for i, cmd := range cmds {
 		getCmd, ok := cmd.(*redis.StringCmd)
 		if !ok {
-			continue
+			return nil, fmt.Errorf("(impossible) unexpected command type for key %q", keys[i])
 		}
 		if getCmd.Err() != nil {
 			if errors.Is(getCmd.Err(), redis.Nil) {
 				continue
 			}
-			return nil, fmt.Errorf("while getting actor: %w", getCmd.Err())
+			return nil, fmt.Errorf("while getting actor %q: %w", keys[i], getCmd.Err())
 		}
 
 		actor := &ateapipb.Actor{}
-		if err := protojson.Unmarshal([]byte(getCmd.Val()), actor); err != nil {
-			return nil, fmt.Errorf("in protojson.Unmarshal: %w", err)
+		if err := proto.Unmarshal([]byte(getCmd.Val()), actor); err != nil {
+			return nil, fmt.Errorf("in proto.Unmarshal: %w", err)
+		}
+
+		// Validate the decoded identity against the key. An empty value decodes
+		// to a zero-valued message under proto.Unmarshal without error, so this
+		// guards against corrupt/empty keys silently surfacing as blank actors
+		// (GetActor performs the same check).
+		if actor.GetActorId() != strings.TrimPrefix(keys[i], "actor:") {
+			return nil, fmt.Errorf("actor record at key %q does not match its key identity", keys[i])
 		}
 		actors = append(actors, actor)
 	}
