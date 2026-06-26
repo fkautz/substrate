@@ -39,6 +39,7 @@ func poolWithClass(namespace, name string, class atev1alpha1.SandboxClass, label
 	return p
 }
 
+// Verifies: REQ-API-031
 func TestEligibleWorkerPools(t *testing.T) {
 	tests := []struct {
 		name              string

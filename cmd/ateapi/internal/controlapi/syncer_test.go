@@ -48,6 +48,7 @@ func setupSyncerTest(t *testing.T, ctx context.Context) (store.Interface, *fake.
 	return persistence, fakeK8s, cleanup
 }
 
+// Verifies: REQ-API-056
 func TestSyncer_Lifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -156,6 +157,7 @@ func TestSyncer_Lifecycle(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-API-051
 func TestSyncer_DeleteBoundWorker_ClearsActor(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

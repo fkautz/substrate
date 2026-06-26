@@ -30,6 +30,7 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+// Verifies: REQ-API-055
 func TestWorkloadSpecFromActorTemplateResolvesValueFromEnv(t *testing.T) {
 	ctx := context.Background()
 	kubeClient := fake.NewSimpleClientset(
@@ -98,6 +99,7 @@ func TestWorkloadSpecFromActorTemplateResolvesValueFromEnv(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-API-049
 func TestWorkloadSpecFromActorTemplateOptionalSecretKeyRefSkipsMissingSecret(t *testing.T) {
 	optional := true
 	got, err := workloadSpecFromActorTemplate(context.Background(), fake.NewSimpleClientset(), nil, &atev1alpha1.ActorTemplate{
@@ -137,6 +139,7 @@ func TestWorkloadSpecFromActorTemplateOptionalSecretKeyRefSkipsMissingSecret(t *
 	}
 }
 
+// Verifies: REQ-API-048
 func TestWorkloadSpecFromActorTemplateSecretKeyRefMissingSecretFails(t *testing.T) {
 	_, err := workloadSpecFromActorTemplate(context.Background(), fake.NewSimpleClientset(), nil, &atev1alpha1.ActorTemplate{
 		ObjectMeta: metav1.ObjectMeta{
@@ -168,6 +171,7 @@ func TestWorkloadSpecFromActorTemplateSecretKeyRefMissingSecretFails(t *testing.
 	}
 }
 
+// Verifies: REQ-API-050
 func TestWorkloadSpecFromActorTemplateEmptyValueFromFails(t *testing.T) {
 	_, err := workloadSpecFromActorTemplate(context.Background(), fake.NewSimpleClientset(), nil, &atev1alpha1.ActorTemplate{
 		ObjectMeta: metav1.ObjectMeta{
@@ -194,6 +198,7 @@ func TestWorkloadSpecFromActorTemplateEmptyValueFromFails(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-API-055
 func TestWorkloadSpecFromActorTemplateCachesSecretsAcrossCalls(t *testing.T) {
 	ctx := context.Background()
 	secretCache := newEnvSecretCache(envSecretCacheTTL)

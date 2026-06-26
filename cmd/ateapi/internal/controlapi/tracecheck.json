@@ -1,0 +1,30 @@
+{
+  "idGrammar": {
+    "pattern": "REQ-API-\\d{3}",
+    "headingPrefix": "REQ-API-",
+    "seriesPattern": "^REQ-(API)-"
+  },
+  "catalog": {
+    "sectionField": "Section",
+    "keywordField": "Keyword",
+    "sectionRefPattern": ""
+  },
+  "tag": {
+    "keyword": "Verifies:",
+    "collectors": [
+      {"lang": "go", "funcPrefixes": ["Test", "Fuzz", "Example"]}
+    ]
+  },
+  "coverage": {
+    "default": "unit",
+    "rules": [
+      {"class": "blackbox", "funcPrefixes": ["TestScenario", "TestSmoke"]}
+    ]
+  },
+  "matrix": {
+    "generatedBy": "`trace-check` (controlapi traceability gate)",
+    "primaryLabel": "Unit coverage",
+    "secondaryLabel": "Black-box coverage"
+  },
+  "skipDirs": [".git", "testdata", "docs", "spec", "node_modules"]
+}

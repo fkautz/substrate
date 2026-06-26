@@ -611,6 +611,7 @@ func deleteWorkerPod(t *testing.T, tc *testContext, ns string, name string) {
 // 1. Creates a mock ActorTemplate in the test namespace.
 // 2. Calls CreateActor RPC.
 // 3. Verifies that the actor is successfully created and returned in the response with a generated ID.
+// Verifies: REQ-API-012
 func TestCreateActor_Success(t *testing.T) {
 	ns := namespaceForTest("ns-create-success")
 	tc := setupTest(t, ns)
@@ -645,6 +646,7 @@ func TestCreateActor_Success(t *testing.T) {
 }
 
 // TestCreateActor_TemplateNotFound tests that creating an actor with a non-existent template fails with FailedPrecondition.
+// Verifies: REQ-API-010
 func TestCreateActor_TemplateNotFound(t *testing.T) {
 	ns := namespaceForTest("ns-create-notfound")
 	tc := setupTest(t, ns)
@@ -659,6 +661,7 @@ func TestCreateActor_TemplateNotFound(t *testing.T) {
 }
 
 // TestCreateActor_Duplicate tests that creating an actor with an existing ID fails.
+// Verifies: REQ-API-011
 func TestCreateActor_Duplicate(t *testing.T) {
 	ns := namespaceForTest("ns-create-dup")
 	tc := setupTest(t, ns)
@@ -684,6 +687,7 @@ func TestCreateActor_Duplicate(t *testing.T) {
 }
 
 // TestGetActor_Found tests that an existing actor can be retrieved.
+// Verifies: REQ-API-052
 func TestGetActor_Found(t *testing.T) {
 	ns := namespaceForTest("ns-get-found")
 	tc := setupTest(t, ns)
@@ -722,6 +726,7 @@ func TestGetActor_Found(t *testing.T) {
 // Workflow:
 // 1. Calls GetActor RPC with a non-existent ID.
 // 2. Verifies that it returns an error (NotFound).
+// Verifies: REQ-API-002
 func TestGetActor_NotFound(t *testing.T) {
 	ns := namespaceForTest("ns-get-notfound")
 	tc := setupTest(t, ns)
@@ -739,6 +744,7 @@ func TestGetActor_NotFound(t *testing.T) {
 // 2. Calls CreateActor twice to create two actors.
 // 3. Calls ListActors RPC.
 // 4. Verifies that both actors are returned in the list.
+// Verifies: REQ-API-053
 func TestListActors(t *testing.T) {
 	ns := namespaceForTest("ns-list-actors")
 	tc := setupTest(t, ns)
@@ -790,6 +796,7 @@ func TestListActors(t *testing.T) {
 }
 
 // TestListActors_Pagination tests that ListActors correctly paginates results.
+// Verifies: REQ-API-045
 func TestListActors_Pagination(t *testing.T) {
 	ns := namespaceForTest("ns-list-actors-pagination")
 	tc := setupTest(t, ns)
@@ -845,6 +852,7 @@ func TestListActors_Pagination(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-API-043
 func TestListActors_PageSizeValidation(t *testing.T) {
 	ns := namespaceForTest("ns-list-actors-validation")
 	tc := setupTest(t, ns)
@@ -873,6 +881,7 @@ func TestListActors_PageSizeValidation(t *testing.T) {
 // 2. Waits for the background WorkerPoolSyncer to mirror it to Redis.
 // 3. Calls ListWorkers RPC.
 // 4. Verifies that the worker appears in the response.
+// Verifies: REQ-API-046
 func TestListWorkers(t *testing.T) {
 	ns := namespaceForTest("ns-list-workers")
 	tc := setupTest(t, ns)
@@ -917,6 +926,7 @@ func TestListWorkers(t *testing.T) {
 // 6. Calls ResumeActor RPC.
 // 7. Verifies that the fake Atelet received the Restore call.
 // 8. Verifies that the actor status is updated to RUNNING.
+// Verifies: REQ-API-054
 func TestResumeActor(t *testing.T) {
 	ns := namespaceForTest("ns-resume")
 	tc := setupTest(t, ns)
@@ -1001,6 +1011,7 @@ func TestResumeActor(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-API-055
 func TestResumeActorResolvesValueFromEnv(t *testing.T) {
 	ns := namespaceForTest("ns-resume-secret-env")
 	tc := setupTest(t, ns)
@@ -1090,6 +1101,7 @@ func TestResumeActorResolvesValueFromEnv(t *testing.T) {
 // 2. Creates an actor.
 // 3. Calls ResumeActor RPC without creating any workers.
 // 4. Verifies that ResumeActor fails with FailedPrecondition status.
+// Verifies: REQ-API-028
 func TestResumeActor_NoWorkers(t *testing.T) {
 	ns := namespaceForTest("ns-resume-no-workers")
 	tc := setupTest(t, ns)
@@ -1118,6 +1130,7 @@ func TestResumeActor_NoWorkers(t *testing.T) {
 // TestResumeActor_NoWorkers: here no WorkerPool's labels satisfy the
 // template's WorkerSelector at all, so there isn't even a pool to look for
 // free workers in.
+// Verifies: REQ-API-027
 func TestResumeActor_NoEligiblePool(t *testing.T) {
 	ns := namespaceForTest("ns-resume-no-eligible-pool")
 	tc := setupTest(t, ns)
@@ -1145,6 +1158,7 @@ func TestResumeActor_NoEligiblePool(t *testing.T) {
 // TestResumeActor_MultiPoolSelector exercises the AND-of-two-selectors path
 // end to end: a template's WorkerSelector gates two pools, and the actor's
 // worker_selector narrows to just one of them.
+// Verifies: REQ-API-054
 func TestResumeActor_MultiPoolSelector(t *testing.T) {
 	ns := namespaceForTest("ns-multi-pool")
 	tc := setupTest(t, ns)
@@ -1194,6 +1208,7 @@ func TestResumeActor_MultiPoolSelector(t *testing.T) {
 // matching only the actor selector must both be rejected, end to end
 // through CreateActor/ResumeActor (not just the eligibleWorkerPools unit
 // test), while a pool matching both is the one actually used.
+// Verifies: REQ-API-031
 func TestResumeActor_RequiresBothSelectorsToMatch(t *testing.T) {
 	ns := namespaceForTest("ns-resume-and-selectors")
 	tc := setupTest(t, ns)
@@ -1245,6 +1260,7 @@ func TestResumeActor_RequiresBothSelectorsToMatch(t *testing.T) {
 // 6. Calls ResumeActor and verifies it fails, but actor status becomes RESUMING.
 // 7. Configures fake Atelet to SUCCEED on Restore.
 // 8. Calls ResumeActor again and verifies it succeeds and actor status becomes RUNNING.
+// Verifies: REQ-API-029
 func TestResumeActor_Reentrancy(t *testing.T) {
 	ns := namespaceForTest("ns-resume-reentrancy")
 	tc := setupTest(t, ns)
@@ -1319,6 +1335,7 @@ func TestResumeActor_Reentrancy(t *testing.T) {
 // 6. Calls ResumeActor to transition it to RUNNING.
 // 7. Calls SuspendActor RPC.
 // 8. Verifies that the fake Atelet received the Suspend call.
+// Verifies: REQ-API-035
 func TestSuspendActor(t *testing.T) {
 	ns := namespaceForTest("ns-suspend")
 	tc := setupTest(t, ns)
@@ -1403,6 +1420,7 @@ func TestSuspendActor(t *testing.T) {
 // 6. Calls ResumeActor to transition it to RUNNING.
 // 7. Calls PauseActor RPC.
 // 8. Verifies that the fake Atelet received the Pause call.
+// Verifies: REQ-API-040
 func TestPauseActor(t *testing.T) {
 	ns := namespaceForTest("ns-pause")
 	tc := setupTest(t, ns)
@@ -1480,6 +1498,7 @@ func TestPauseActor(t *testing.T) {
 
 // TestUpdateActor_Success verifies UpdateActor replaces the actor's
 // worker_selector and that the change is durably persisted.
+// Verifies: REQ-API-017
 func TestUpdateActor_Success(t *testing.T) {
 	ns := namespaceForTest("ns-update-actor")
 	tc := setupTest(t, ns)
@@ -1534,6 +1553,7 @@ func TestUpdateActor_Success(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-API-016
 func TestUpdateActor_NotFound(t *testing.T) {
 	ns := namespaceForTest("ns-update-actor-notfound")
 	tc := setupTest(t, ns)
@@ -1557,6 +1577,8 @@ func TestUpdateActor_NotFound(t *testing.T) {
 //  3. Updates the actor's selector to tier=b, making pool-a ineligible.
 //  4. Resumes again; asserts it succeeds onto worker-b, and that worker-a
 //     has been released (actor_id cleared) rather than left dangling.
+//
+// Verifies: REQ-API-030
 func TestResumeActor_ReleasesStaleWorkerWhenPoolBecomesIneligible(t *testing.T) {
 	ns := namespaceForTest("ns-resume-release-stale")
 	tc := setupTest(t, ns)
@@ -1644,6 +1666,8 @@ func TestResumeActor_ReleasesStaleWorkerWhenPoolBecomesIneligible(t *testing.T) 
 //  4. Suspends then resumes the actor; asserts it now lands on
 //     pool-b/worker-b, proving the updated selector — not the one in effect
 //     when it was first scheduled — governs the new placement.
+//
+// Verifies: REQ-API-031
 func TestUpdateActor_ReassignsPoolAcrossSuspendResume(t *testing.T) {
 	ns := namespaceForTest("ns-update-actor-suspend-resume")
 	tc := setupTest(t, ns)
@@ -1722,6 +1746,7 @@ func TestUpdateActor_ReassignsPoolAcrossSuspendResume(t *testing.T) {
 // 1. Uses table-driven tests for each RPC method (CreateActor, GetActor, ResumeActor, SuspendActor).
 // 2. Passes invalid requests (missing required fields).
 // 3. Verifies that all requests fail with an error.
+// Verifies: REQ-API-006
 func TestValidation(t *testing.T) {
 	ns := namespaceForTest("ns-validation")
 	tc := setupTest(t, ns)
@@ -1875,6 +1900,7 @@ func TestValidation(t *testing.T) {
 	})
 }
 
+// Verifies: REQ-API-029
 func TestResumeActor_LockConflict(t *testing.T) {
 	ns := namespaceForTest("ns-resume-conflict")
 	tc := setupTest(t, ns)
@@ -1921,6 +1947,7 @@ func TestResumeActor_LockConflict(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-API-054
 func TestResumeActor_DanglingWorker(t *testing.T) {
 	ns := namespaceForTest("ns-resume-dangling")
 	tc := setupTest(t, ns)
@@ -2001,6 +2028,7 @@ func TestResumeActor_DanglingWorker(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-API-035
 func TestSuspendActor_DanglingWorker(t *testing.T) {
 	ns := namespaceForTest("ns-sd")
 	tc := setupTest(t, ns)
@@ -2060,6 +2088,7 @@ func TestSuspendActor_DanglingWorker(t *testing.T) {
 	}
 }
 
+// Verifies: REQ-API-022
 func TestDeleteActor_Success(t *testing.T) {
 	ns := namespaceForTest("ns-delete-success")
 	tc := setupTest(t, ns)
@@ -2089,6 +2118,7 @@ func TestDeleteActor_Success(t *testing.T) {
 	assertGrpcError(t, err, codes.NotFound, "Actor id1 not found")
 }
 
+// Verifies: REQ-API-022
 func TestDeleteActor_NotSuspended(t *testing.T) {
 	ns := namespaceForTest("ns-delete-notsuspended")
 	tc := setupTest(t, ns)
@@ -2119,6 +2149,7 @@ func TestDeleteActor_NotSuspended(t *testing.T) {
 	assertGrpcError(t, err, codes.FailedPrecondition, "Actor id1 is not suspended (status: STATUS_RUNNING)")
 }
 
+// Verifies: REQ-API-021
 func TestDeleteActor_NotFound(t *testing.T) {
 	ns := namespaceForTest("ns-delete-notfound")
 	tc := setupTest(t, ns)
