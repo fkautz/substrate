@@ -2864,8 +2864,8 @@ ENC-RD-2: A restorer MUST interpret a runtime delta ONLY under a runtime satisfy
     base_memory (32); runtime_state (32); memory_layout (32); sandbox_pin (32
     sha256); compat_matrix (the CompatMatrix sub-record below); assurance_mode
     (u8: 1=asserted 2=derived-attested 3=node-derived); runtime_state_policy (u8:
-    0=runtime-state-required, the default; 1=no-non-memory-runtime-state-at-restore-
-    point, the RDELTA-1 exception, ENC-BD-5).
+    0=runtime-state-required, the default; 1=no-non-memory-runtime-state-required-
+    for-memory-resume, the RDELTA-1 exception, ENC-BD-5).
 
   CompatMatrix (fixed field order, each as typed): runtime_id (varbytes);
     runtime_version (varbytes); platform_mode (u8: 1=ptrace 2=systrap 3=KVM);
