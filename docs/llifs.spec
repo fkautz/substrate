@@ -1,6 +1,6 @@
 LLIFS Specification
 
-Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). A third hardening pass then defined the RDELTA-1 no-runtime-state exception (a signed base-descriptor field, ENC-BD-5, whose semantics are a resume-time guarantee for any later memory-persisting snapshot, not merely a property of the base restore point) and its verifier step, fixed the opaque-runtime-object framing convention (ENC-3: base runtime_state and the runtime delta are raw, unframed; all other encodings are framed), forbade the runtime delta from carrying memory/filesystem bytes (ENC-RD-1), pinned the virtual zero-subtree derivation recurrence (SPARSE-8), split runtime-delta observability (OBS-9), and added the four-interface Phase-1 implementation surface (§16.1). Phase 1 prototyping is green-lit from this draft. The §15.3 Terrapin vectors are now CROSS-CONFIRMED by two independent v0.3 oracles (terrapin-rs and terrapin-go), closing ENC-CONF-2; per-level zero-subtree roots (SPARSE-8) are pinned. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): runtime-delta implementation proof on a real gVisor hibernate/resume path; and reconcile the §15.8 LLWI1 field set against atelet.WorkloadSpec (ENC-WI-1) - a workload-identity mismatch is a restore-safety bug.
+Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). A third hardening pass then defined the RDELTA-1 no-runtime-state exception (a signed base-descriptor field, ENC-BD-5, whose semantics are a resume-time guarantee for any later memory-persisting snapshot, not merely a property of the base restore point) and its verifier step, fixed the opaque-runtime-object framing convention (ENC-3: base runtime_state and the runtime delta are raw, unframed; all other encodings are framed), forbade the runtime delta from carrying memory/filesystem bytes (ENC-RD-1), pinned the virtual zero-subtree derivation recurrence (SPARSE-8), split runtime-delta observability (OBS-9), and added the four-interface Phase-1 implementation surface (§16.1). Phase 1 prototyping is green-lit from this draft. The §15.3 Terrapin vectors are now CROSS-CONFIRMED by two independent v0.3 oracles (terrapin-rs and terrapin-go), closing ENC-CONF-2; per-level zero-subtree roots (SPARSE-8) are pinned. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): runtime-delta implementation proof on a real gVisor hibernate/resume path; and grow atelet.WorkloadSpec (and ateom's reduced Container) to supply the full LLWI1 workload identity (docs/workload-identity-expansion.md, ENC-WI-1) - LLWI1 is the target identity and is deliberately NOT pared to the current proto, since a workload-identity mismatch is a restore-safety bug.
 System: LLIFS (a verified, deduped, lazily-faulted state substrate for high-density agent FaaS).
 Primary target: gVisor (runsc) checkpoint/restore; Firecracker microVM next. One content-addressed, Terrapin-verified store delivers two state planes: a filesystem plane and a memory plane.
 External identity: OCI-compatible sha256.
@@ -1350,23 +1350,23 @@ SR-4: A State Root that persists ANY per-agent plane (memory or filesystem) MUST
       the memory plane MUST additionally commit the sandbox pin (§2.5,
       DIGEST-BIND-7) and the runtime delta unless signed policy proves none is
       required (RDELTA-1).
-SR-5: The WORKLOAD IDENTITY is a canonical Terrapin digest (§15 LLWI1) over the
-      RESTORE-VISIBLE fields of the control plane's workload spec
-      (atelet.WorkloadSpec): every field that, if different at restore, could
-      invalidate or make unsafe the reapplication of a persisted memory/filesystem
-      delta. It MUST commit, at pod scope: the pause image, hostname, the host- and
-      shared-namespace flags, and the pod security context; and per container, in
-      declared order: name, image, command, args, env, working directory, run-as
-      user/group, capabilities (added and dropped), security profile (privileged,
+SR-5: The WORKLOAD IDENTITY is a canonical Terrapin digest (§15 LLWI1) over every
+      RESTORE-VISIBLE per-workload field: at pod scope the pause image, hostname,
+      host- and shared-namespace flags, and pod security context; and per container
+      name, image, command, args, env, working directory, run-as user/group,
+      capabilities (added and dropped), security profile (privileged,
       read-only-rootfs, no-new-privileges, seccomp/AppArmor/SELinux), mount and
-      volume-device topology (mount path, sub-path, read-only, source name/type),
-      exposed devices, and the restore-relevant resource limits (at least the memory
-      limit, which constrains the guest address space). Fields intentionally EXCLUDED
-      (they do not affect restored state or are regenerated post-restore) are
-      enumerated in §15 LLWI1 (ENC-WI-2). On restore the supplied workload MUST match
-      the committed workload identity exactly; a mismatch MUST reject, never silently
-      restore. Any atelet.WorkloadSpec field that affects restore correctness MUST be
-      added to LLWI1 and to this list, never silently ignored.
+      volume-device topology, exposed devices, and restore-relevant resource limits
+      (at least the memory limit, which bounds the guest address space). LLWI1 is the
+      TARGET identity and is NOT pared to the current proto: atelet.WorkloadSpec (and
+      ateom's reduced Container) MUST grow to supply these fields
+      (docs/workload-identity-expansion.md), a release blocker. Per-base/runtime
+      invariants that also affect restore (seccomp, namespaces, cgroups, ABI,
+      platform, arch, page size, CPU features) are committed by the base descriptor's
+      compatibility matrix (§11.4), not duplicated here. Fields intentionally excluded
+      are enumerated in §15 LLWI1 (ENC-WI-2). On restore the supplied workload MUST
+      match the committed workload identity exactly; a mismatch MUST reject, never
+      silently restore.
 SR-6: created is committed, so it participates in identity: two snapshots of one
       actor collapse to one State Root identifier ONLY when all committed fields,
       including created, are byte-identical (intended idempotent-retry behavior,
@@ -3074,7 +3074,11 @@ ENC-FD-3: The filesystem delta MUST be directly resolvable (DELTA-5): it encodes
 15.8 Workload identity encoding (LLWI1)
 
 The §6.2 SR-5 canonical workload identity (an internal Terrapin identity, not an
-external digest).
+external digest). LLWI1 is the TARGET identity: it commits every restore-visible
+per-workload field, INCLUDING fields atelet.WorkloadSpec does not yet carry. It is
+deliberately NOT pared to the current proto; instead the proto (and ateom's reduced
+Container) MUST grow to supply these fields. The required proto changes are specified
+in docs/workload-identity-expansion.md.
 
   magic "LWI1"; version u16=2; then a pod block, then containers.
 
@@ -3104,30 +3108,35 @@ external digest).
 
   workload_identity = Terrapin identifier of these bytes.
 
-ENC-WI-1: Fields are the restore-visible projection of atelet.WorkloadSpec (which
-          carries them); ateom's reduced Container is insufficient (§12). Every list
-          is ALWAYS present with its count; absent and empty lists are identical
-          (count 0). env, capAdd, capDrop, mounts, and devices MUST be sorted as
-          stated and unique by their sort key (a duplicate env name, capability,
-          mount path, or device path MUST reject). Unset scalars use their stated
-          sentinel (i64 -1, u64 0, varbytes length 0). The encoding MUST be
-          deterministic. (This is the value of the State Root `workload` field, §6.2;
-          "workload_spec_digest" is a deprecated alias for workload_identity.) The
-          exact field set MUST be reconciled against atelet.WorkloadSpec before §15
-          is frozen. This is a HARD freeze blocker, not a nicety: a workload-identity
-          mismatch is a restore-safety bug, so any WorkloadSpec field that affects
-          restore correctness MUST be added here (SR-5) before v1.0 freezes.
-ENC-WI-2: Fields intentionally EXCLUDED, because they do not affect restored state or
-          are regenerated post-restore, MUST NOT be committed: scheduling and
-          placement (node name, affinity, tolerations, priority, topology); status
-          and conditions; liveness/readiness/startup probes; restart policy; image
-          pull policy and pull secrets (provenance, not restore state);
-          purely-informational labels and annotations; dynamically assigned values
-          (pod IP, assigned ports, service-account token contents) and other
-          RHAZARD-refreshed state (§5.6); and volume CONTENTS (the data lives in the
-          filesystem plane; only mount TOPOLOGY is committed, above). An annotation
-          that materially changes runtime execution is NOT informational and MUST be
-          committed (SR-5).
+ENC-WI-1: Fields are the restore-visible per-workload set above. Every list is ALWAYS
+          present with its count; absent and empty lists are identical (count 0). env,
+          capAdd, capDrop, mounts, and devices MUST be sorted as stated and unique by
+          their sort key (a duplicate env name, capability, mount path, or device path
+          MUST reject). Unset scalars use their stated sentinel (i64 -1, u64 0,
+          varbytes length 0). The encoding MUST be deterministic. (Value of the State
+          Root `workload` field, §6.2; "workload_spec_digest" is a deprecated alias.)
+          RECONCILIATION: today atelet.WorkloadSpec carries only pause_image and
+          per-container name/image/command/env, and ateom's Container is smaller
+          still; the remaining fields REQUIRE growing the proto (and ateom's
+          Container), specified in docs/workload-identity-expansion.md. That growth is
+          a release blocker: until the proto supplies a field the encoder cannot
+          populate it, and committing a field the proto cannot supply (always its
+          default) is the restore-safety bug this rule prevents. LLWI1 MUST NOT be
+          pared to the current proto; the proto grows to LLWI1.
+ENC-WI-2: Per-base/runtime INVARIANTS that also affect restore, seccomp, namespaces,
+          cgroups, ABI, platform mode, arch, page size, CPU features, are committed by
+          the base descriptor's compatibility matrix (§11.4 MATRIX-1) and enforced by
+          MATCH-COMPAT (MATRIX-3); where such an attribute is per-base it lives in the
+          matrix, where it is per-workload it lives here, and the two MUST NOT
+          double-commit the same authority (the split is decided per field in the
+          expansion doc). Fields intentionally EXCLUDED, no restore effect or
+          regenerated, MUST NOT be committed: scheduling/placement (node name,
+          affinity, tolerations, priority, topology); status/conditions;
+          liveness/readiness/startup probes; restart policy; image pull policy and
+          pull secrets; informational labels/annotations; dynamically assigned values
+          (pod IP, ports, service-account token) and other RHAZARD-refreshed state
+          (§5.6); and volume CONTENTS (the data lives in the filesystem plane; only
+          mount TOPOLOGY is committed).
 
 ⸻
 
