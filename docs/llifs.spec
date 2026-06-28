@@ -3252,6 +3252,15 @@ verification count, foreground memory-fault p50/p95/p99, absent-range fault
 behavior, known-zero behavior, and TTR (§7.6). These numbers, not a feature list,
 are what distinguish a real density substrate from a merely lazy restore.
 
+Validated (kernel level): the primitive this gate depends on, N processes sharing
+one base MAP_PRIVATE with copy-on-write plus userfaultfd absent-not-zero and
+known-zero-without-fetch, has been demonstrated on Linux aarch64 (see
+benchmarking/density_smoke.c and benchmarking/density-prototype-findings.md):
+8 procs over a 256 MiB base measured rss=256 MiB but pss~=base/8, a write stayed
+private to the writer, and absent pages populated from the base (never zero). This
+de-risks GVISOR-3; the gVisor MemoryFile change itself and the verified-in-loop
+N-sandbox run through runsc remain.
+
 Implementation surface (keep Phase 1 ruthlessly focused on four interfaces; defer
 fork, yield, P2P, scheduler warmth, fleet GC, and native backends until physical
 sharing and absent-vs-zero correctness are proven under load):
