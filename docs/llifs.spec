@@ -1,6 +1,6 @@
 LLIFS Specification
 
-Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). Phase 1 prototyping is green-lit from this draft. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): add the runtime delta (done in this draft, pending implementation proof); independently reproduce the §15.3 Terrapin conformance vectors via a second oracle (ENC-CONF-2); and reconcile the §15.8 LLWI1 field set against atelet.WorkloadSpec (ENC-WI-1) - a workload-identity mismatch is a restore-safety bug.
+Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). A third hardening pass then defined the RDELTA-1 no-runtime-state exception (a signed base-descriptor field, ENC-BD-5, whose semantics are a resume-time guarantee for any later memory-persisting snapshot, not merely a property of the base restore point) and its verifier step, fixed the opaque-runtime-object framing convention (ENC-3: base runtime_state and the runtime delta are raw, unframed; all other encodings are framed), forbade the runtime delta from carrying memory/filesystem bytes (ENC-RD-1), pinned the virtual zero-subtree derivation recurrence (SPARSE-8), split runtime-delta observability (OBS-9), and added the four-interface Phase-1 implementation surface (§16.1). Phase 1 prototyping is green-lit from this draft. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): add the runtime delta (done in this draft, pending implementation proof); independently reproduce the §15.3 Terrapin conformance vectors via a second oracle (ENC-CONF-2); and reconcile the §15.8 LLWI1 field set against atelet.WorkloadSpec (ENC-WI-1) - a workload-identity mismatch is a restore-safety bug.
 System: LLIFS (a verified, deduped, lazily-faulted state substrate for high-density agent FaaS).
 Primary target: gVisor (runsc) checkpoint/restore; Firecracker microVM next. One content-addressed, Terrapin-verified store delivers two state planes: a filesystem plane and a memory plane.
 External identity: OCI-compatible sha256.
@@ -280,7 +280,8 @@ base descriptor
   base rootfs (logicalRootfsDigest + layoutDigest), base memory snapshot, the
   non-memory runtime-state blob needed to resume (threads, fds, namespaces,
   vCPU/sentry state), the memory layout, the sandbox pin (§2.5), the runtime
-  compatibility matrix (§11.4), and the assurance mode. (The full committed field
+  compatibility matrix (§11.4), the assurance mode, and the runtime-state policy
+  (the §15.5 ENC-BD-5 no-runtime-state assertion). (The full committed field
   list and encoding are §2.5 DIGEST-BIND-3 and §15.5 LLBD1.) A base descriptor is builder- or derived-attested and is the
   shared, multi-agent base identity. The (rootfs + memory + runtime-state +
   layout) tuple MUST NOT be recombinable across bases (it is committed as a
@@ -407,8 +408,9 @@ single signature subject:
     │
     └── the signed base descriptor commits ALL of the above as one unit (
         OCI digest, logicalRootfsDigest, layoutDigest, base memory snapshot,
-        runtime-state blob, memory layout, sandbox pin, compatibility matrix, and
-        assurance mode) so none can be recombined and the base memory snapshot
+        runtime-state blob, memory layout, sandbox pin, compatibility matrix,
+        assurance mode, and runtime-state policy) so none can be recombined and the
+        base memory snapshot
         (not derivable from the rootfs digests) is bound to the same OCI subject.
 
 Runtime-attested regime (per-agent state). A memory delta, filesystem delta, runtime
@@ -449,7 +451,7 @@ DIGEST-BIND-3:
   The signed base descriptor MUST be the single attested object binding, as one
   unit, the OCI image digest, logicalRootfsDigest, layoutDigest, base memory
   snapshot, runtime-state blob, memory layout, sandbox pin, compatibility matrix
-  (§11.4), and assurance mode.
+  (§11.4), assurance mode, and runtime-state policy (§15.5 ENC-BD-5).
   These MUST NOT be recombinable across base descriptors, and the base memory
   snapshot MUST be bound to the same OCI subject through this descriptor (it is
   not derivable from the rootfs digests).
@@ -739,9 +741,15 @@ SPARSE-8: Virtual zero applies to PROOF blocks too, not just data. A hash-file/p
           stands for. This is required for very large sparse objects (notably the
           guest-address-linear memory image, MEM-1, where a high-address mapped-data
           block's proof siblings may be entirely zero subtrees): a verifier resolves
-          such proof blocks from the zero constant (§2.2), never the network. A
+          such proof blocks from the zero constant (§2.2), never the network. The
+          all-zero subtree root at each level MUST be derived by the Terrapin
+          node-hash recurrence over identical zero-child digests: the level-0 zero
+          root is the §2.2 zero-leaf constant, and a level-L zero root is the Terrapin
+          node hash over the profile's fanout of level-(L-1) zero roots. §15.10
+          ENC-CONF-2 MUST pin the zero-subtree root for each level the profile uses,
+          so independent implementations cannot invent divergent shortcut rules; a
           conformance vector MUST exercise a high-address mapped-data region behind a
-          large zero span (§15.10 ENC-CONF-2).
+          large zero span.
 
 Small files:
 
@@ -1267,9 +1275,19 @@ DELTA-5: A persisted delta (memory, filesystem, or runtime) MUST be directly
          the resume-critical resolved form (direct component object ids) MUST be
          obtainable without walking lineage (e.g. via the bootstrap, §7 BOOT-2).
 RDELTA-1: A State Root that persists the memory plane MUST also commit a runtime
-         delta, UNLESS signed runtime policy proves no non-memory runtime state is
-         required for resume. reset, golden, clean, and filesystem-only persistence
-         need none (§6.6).
+         delta, UNLESS its base descriptor carries the signed NO-RUNTIME-STATE
+         ASSERTION. That assertion has one canonical home: the base descriptor's
+         runtime_state_policy field (§15.5 ENC-BD-5; value 1 asserts that no
+         non-memory runtime state is required to resume ANY memory-persisting State
+         Root on this base, the runtime reconstructing all execution metadata from
+         committed memory/filesystem state and signed policy, NOT merely that the base
+         restore point held none), committed by the signed base descriptor and so
+         validated as part of base-descriptor validation (DIGEST-BIND-3/6).
+         Restore MUST check it BEFORE accepting a memory-persisting State Root whose
+         runtime is "none"; absent it (runtime_state_policy==0, the default), memory
+         non-none with runtime "none" MUST fail closed (RDELTA-5). reset, golden,
+         clean, and filesystem-only persistence need no runtime delta and no
+         assertion (§6.6).
 RDELTA-2: The runtime delta is a Terrapin object over runtime-native bytes (§15
          LLRD1), interpretable ONLY by a runtime satisfying the sandbox pin (§2.5)
          and the compatibility matrix (§11.4); LLIFS defines no portable structure
@@ -1700,6 +1718,10 @@ BOOT-2: A resume bootstrap MUST carry everything needed to validate AND restore
         resume
         pack BlockRef list; and inlined proofs for all resume-critical blocks. Any
         of these MAY be omitted only if proven already locally cached and verified.
+        For a memory-persisting State Root whose runtime is "none", the base
+        descriptor's runtime_state_policy==1 assertion (RDELTA-1, ENC-BD-5) is part of
+        the carried base descriptor and MUST be validated on this no-round-trip path
+        before resume proceeds.
 BOOT-3: P0 startup/resume reads AND their verification MUST NOT require a metadata,
         proof, or attestation network round trip; everything needed before
         exec/unfreeze MUST be in the bootstrap or locally cached. (Proof blocks for
@@ -2510,6 +2532,12 @@ OBS-4: Repeated verification failures and corrupt-source ejections MUST surface 
        security events (§14), distinct from ordinary fetch failures.
 OBS-5: All tenant-visible telemetry MUST be cache-domain-scoped (§9 REDACT-1..3);
        cross-domain aggregates are operator-only.
+OBS-9: Runtime-delta cost MUST be reported separately from memory- and
+       filesystem-delta cost (§13.2), because the runtime delta is resolved and
+       applied on the resume critical path (RDELTA-4/5) and could become the restore
+       bottleneck. A deployment SHOULD set a runtime-delta size budget; a runtime
+       delta exceeding it MUST be reported (llifs_runtime_delta_oversized_total) and
+       MAY be rejected at capture by policy.
 
 ⸻
 
@@ -2525,6 +2553,9 @@ OBS-5: All tenant-visible telemetry MUST be cache-domain-scoped (§9 REDACT-1..3
     llifs_terrapin_proof_cache_hits_total
   Snapshot write / lifecycle:
     llifs_snapshot_write_latency_ms      llifs_snapshot_delta_bytes
+    llifs_memory_delta_bytes             llifs_filesystem_delta_bytes
+    llifs_runtime_delta_bytes            llifs_runtime_delta_apply_latency_ms
+    llifs_runtime_delta_oversized_total
     llifs_reset_per_sec                  llifs_wake_latency_ms
     llifs_hibernate_delta_bytes          llifs_ram_reclaimed_bytes
     llifs_fork_latency_ms                llifs_inplace_rewind_rejected_total
@@ -2727,7 +2758,7 @@ parser MUST reject trailing bytes.
   memory layout               LLML1  §15.5  → memory layout identifier
   memory delta (page-indexed) LLMD1  §15.6  → memory delta identifier
   filesystem (overlay) delta  LLFD1  §15.7  → filesystem delta identifier
-  runtime delta (opaque)      LLRD1  §15.4  → runtime delta identifier
+  runtime delta (raw opaque)  LLRD1  §15.4  → runtime delta identifier
   workload identity           LLWI1  §15.8  → workload_identity
   sandbox pin                 LLSP1  §15.9  → sandbox pin (external sha256)
 
@@ -2736,7 +2767,14 @@ ENC-1: A new object's identity MUST be the Terrapin identifier of its canonical
        §15.9). LLT1/LLAY1 (§3.2/§4.3) are normative as written and not restated.
 ENC-2: Every canonical document MUST begin with its 4-byte magic and a u16 version,
        MUST length-frame its records, and MUST reject trailing bytes and unknown
-       enum values.
+       enum values (raw opaque runtime-native objects are the exception: ENC-3).
+ENC-3: Opaque runtime-native objects, the base runtime_state blob (§15.5) and the
+       runtime delta (LLRD1, §15.4), are RAW Terrapin byte objects: LLIFS defines no
+       magic, version, or framing and does not parse them; their identifier is
+       terrapin-sha256 over the exact runtime-produced bytes, and compatibility is
+       gated externally by the sandbox pin and compatibility matrix (§11.4, MATRIX-3).
+       Every other encoding in this registry is an LLIFS-framed structural object
+       (ENC-2).
 
 ⸻
 
@@ -2796,20 +2834,24 @@ ENC-SR-2: Exactly the §6.2/SR-4 conditional rules apply: if memory or filesyste
           and is "none" only under the RDELTA-1 no-runtime-state policy exception;
           restore enforces RDELTA-5.
 
-Runtime delta encoding (LLRD1), the State Root's runtime field (§6.1 DELTA-2R):
+Runtime delta (LLRD1), the State Root's runtime field (§6.1 DELTA-2R):
 
-  magic "LRD1"; version u16=1; payload (varbytes, opaque runtime-native bytes
-  captured at freeze). Runtime delta identifier = Terrapin identifier of these bytes.
+  The runtime delta is a RAW opaque runtime-native Terrapin object: LLIFS defines no
+  magic, version, or framing and does not parse it, exactly like the base
+  runtime_state blob (§15.5 ENC-BD-3). Its identifier is terrapin-sha256 over the
+  exact runtime-produced bytes (ENC-3).
 
-ENC-RD-1: payload is OPAQUE to LLIFS (no internal structure, like the base
-          runtime_state blob, §15.5 ENC-BD-3); its Terrapin identifier covers the
-          exact stored bytes; trailing bytes MUST reject. A later version MAY define
-          a structured delta against the base runtime_state blob.
+ENC-RD-1: The runtime delta MUST contain ONLY runtime-native execution metadata
+          needed to reapply the diverged non-memory, non-filesystem state. Guest
+          memory page contents MUST be carried in the memory delta (LLMD1) and
+          writable-upper contents in the filesystem delta (LLFD1); the runtime delta
+          MUST NOT be a backdoor "opaque checkpoint" for memory or filesystem bytes.
 ENC-RD-2: A restorer MUST interpret a runtime delta ONLY under a runtime satisfying
           the State Root's sandbox pin (§2.5) and the base descriptor's compatibility
-          matrix (§11.4), and MUST apply it only after the base runtime-state blob
-          (RDELTA-5); an incompatible or missing-required runtime delta MUST fail
-          closed (RDELTA-1/5).
+          matrix (§11.4, MATCH-COMPAT MATRIX-3), and MUST apply it only after the base
+          runtime-state blob (RDELTA-5); an incompatible or missing-required runtime
+          delta MUST fail closed (RDELTA-1/5). A future STRUCTURED runtime delta would
+          be a separate LLIFS-framed object with its own magic, not this opaque form.
 
 ⸻
 
@@ -2821,7 +2863,9 @@ ENC-RD-2: A restorer MUST interpret a runtime delta ONLY under a runtime satisfy
     ENC-BD-4); logical_rootfs (32); layout (32);
     base_memory (32); runtime_state (32); memory_layout (32); sandbox_pin (32
     sha256); compat_matrix (the CompatMatrix sub-record below); assurance_mode
-    (u8: 1=asserted 2=derived-attested 3=node-derived).
+    (u8: 1=asserted 2=derived-attested 3=node-derived); runtime_state_policy (u8:
+    0=runtime-state-required, the default; 1=no-non-memory-runtime-state-at-restore-
+    point, the RDELTA-1 exception, ENC-BD-5).
 
   CompatMatrix (fixed field order, each as typed): runtime_id (varbytes);
     runtime_version (varbytes); platform_mode (u8: 1=ptrace 2=systrap 3=KVM);
@@ -2854,6 +2898,20 @@ ENC-BD-4: oci_image_digest MUST be the canonical OCI digest STRING form, the exa
           uppercase hex, other algorithms, or a missing prefix MUST reject). It is
           the only base-descriptor field in the external plane; all other digest
           fields are raw 32-byte Terrapin identifiers.
+ENC-BD-5: runtime_state_policy is the canonical signed NO-RUNTIME-STATE ASSERTION
+          (RDELTA-1): value 1 asserts that NO non-memory runtime state is required to
+          resume ANY memory-persisting State Root on this base under this policy,
+          because the runtime can reconstruct all required execution metadata from the
+          committed memory and filesystem state plus signed runtime policy. It is NOT
+          the weaker claim that the base's restore point merely happened to hold none
+          (a running agent can later accrue fd offsets, epoll/timer/signal/
+          syscall-restart/socket state); it is the resume-time guarantee for later
+          snapshots. It permits a memory-persisting State Root to set runtime "none".
+          Because it is committed by the signed base descriptor (ENC-BD-2),
+          restore validates it as part of base-descriptor validation (DIGEST-BIND-3/
+          6); a State Root with memory non-none and runtime "none" MUST reject unless
+          its base descriptor carries runtime_state_policy==1. Unknown values MUST
+          reject.
 
 Memory layout encoding (LLML1), the base descriptor's memory_layout field (§5.3):
 
@@ -3093,9 +3151,16 @@ ENC-CONF-2: A reference oracle (a non-production tool sharing the Terrapin core)
             (LLML1) case with a mapped-data region at a HIGH guest address preceded by
             a very large unmapped/no-access zero span (to catch tree-height and
             off-by-one bugs in the virtual zero-subtree proof rules, SPARSE-8), plus a
-            mapped-zero vs unmapped state-mismatch reject case; an LLSR1 round trip
-            WITH a non-none runtime delta (LLRD1) present; and at least one round trip
-            for LLSR1/LLBD1/LLMD1/LLFD1/LLRD1/LLWI1/LLSP1 plus their reject cases.
+            mapped-zero vs unmapped state-mismatch reject case; the per-level all-zero
+            subtree roots Z_0..Z_L the 2 MiB profile uses (SPARSE-8 mandates pinning
+            these so virtual proof blocks are byte-identical across implementations);
+            an LLSR1 round trip WITH a non-none runtime delta present, and an LLBD1
+            round trip with runtime_state_policy==1 plus a memory-non-none /
+            runtime-none State Root that MUST reject without it (RDELTA-1, ENC-BD-5);
+            and at least one round trip for LLSR1/LLBD1/LLMD1/LLFD1/LLWI1/LLSP1 plus
+            their reject cases. The runtime delta and base runtime_state blob are raw
+            opaque objects (ENC-3): they have NO parse reject cases; only an identity
+            round trip (terrapin-sha256 over fixed bytes) is exercised.
 ENC-CONF-3: The production digest-producing code SHOULD be a single implementation
             (the digest boundary is the language boundary) so independent
             implementations cannot silently diverge; the oracle's vectors are the
@@ -3164,6 +3229,17 @@ proportional set size (PSS) per sandbox, dirty pages per sandbox, Terrapin
 verification count, foreground memory-fault p50/p95/p99, absent-range fault
 behavior, known-zero behavior, and TTR (§7.6). These numbers, not a feature list,
 are what distinguish a real density substrate from a merely lazy restore.
+
+Implementation surface (keep Phase 1 ruthlessly focused on four interfaces; defer
+fork, yield, P2P, scheduler warmth, fleet GC, and native backends until physical
+sharing and absent-vs-zero correctness are proven under load):
+  - BlockRef resolver: object / level / blockIndex -> verified bytes or fail closed.
+  - CAS-backed rootfs gofer: path + offset -> content-object BlockRef -> verified
+    bytes (GVISOR-1).
+  - CAS-backed restore page provider: pages-file offset / guest address -> memory
+    layout mapping -> base BlockRef (GVISOR-2, GVISOR-6).
+  - Shared MemoryFile backing: N sandboxes MAP_PRIVATE the same verified base pages
+    (GVISOR-3).
 
 ⸻
 
@@ -3270,8 +3346,9 @@ Canonical terms (the only terms this document uses for stored state and lifecycl
                         informal adjective only.)
   base descriptor       Signed identity binding OCI image digest + base rootfs +
                         base memory + runtime-state + memory layout + sandbox pin
-                        + assurance mode, as one unit (§2.5, DIGEST-BIND-3).
-                        (Subsumes the earlier "checkpoint manifest".)
+                        + compatibility matrix + assurance mode + runtime-state
+                        policy, as one unit (§2.5, DIGEST-BIND-3). (Subsumes the
+                        earlier "checkpoint manifest".)
   overlay               Live per-agent writable layer (dirty pages + fs upper);
                         ephemeral, never in shared CAS. (Was: "divergence".)
   delta                 Persisted content-addressed snapshot of an overlay, in three
