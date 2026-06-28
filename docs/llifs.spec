@@ -1,6 +1,6 @@
 LLIFS Specification
 
-Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). A third hardening pass then defined the RDELTA-1 no-runtime-state exception (a signed base-descriptor field, ENC-BD-5, whose semantics are a resume-time guarantee for any later memory-persisting snapshot, not merely a property of the base restore point) and its verifier step, fixed the opaque-runtime-object framing convention (ENC-3: base runtime_state and the runtime delta are raw, unframed; all other encodings are framed), forbade the runtime delta from carrying memory/filesystem bytes (ENC-RD-1), pinned the virtual zero-subtree derivation recurrence (SPARSE-8), split runtime-delta observability (OBS-9), and added the four-interface Phase-1 implementation surface (§16.1). Phase 1 prototyping is green-lit from this draft. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): add the runtime delta (done in this draft, pending implementation proof); independently reproduce the §15.3 Terrapin conformance vectors via a second oracle (ENC-CONF-2); and reconcile the §15.8 LLWI1 field set against atelet.WorkloadSpec (ENC-WI-1) - a workload-identity mismatch is a restore-safety bug.
+Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). A third hardening pass then defined the RDELTA-1 no-runtime-state exception (a signed base-descriptor field, ENC-BD-5, whose semantics are a resume-time guarantee for any later memory-persisting snapshot, not merely a property of the base restore point) and its verifier step, fixed the opaque-runtime-object framing convention (ENC-3: base runtime_state and the runtime delta are raw, unframed; all other encodings are framed), forbade the runtime delta from carrying memory/filesystem bytes (ENC-RD-1), pinned the virtual zero-subtree derivation recurrence (SPARSE-8), split runtime-delta observability (OBS-9), and added the four-interface Phase-1 implementation surface (§16.1). Phase 1 prototyping is green-lit from this draft. The §15.3 Terrapin vectors are now CROSS-CONFIRMED by two independent v0.3 oracles (terrapin-rs and terrapin-go), closing ENC-CONF-2; per-level zero-subtree roots (SPARSE-8) are pinned. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): runtime-delta implementation proof on a real gVisor hibernate/resume path; and reconcile the §15.8 LLWI1 field set against atelet.WorkloadSpec (ENC-WI-1) - a workload-identity mismatch is a restore-safety bug.
 System: LLIFS (a verified, deduped, lazily-faulted state substrate for high-density agent FaaS).
 Primary target: gVisor (runsc) checkpoint/restore; Firecracker microVM next. One content-addressed, Terrapin-verified store delivers two state planes: a filesystem plane and a memory plane.
 External identity: OCI-compatible sha256.
@@ -2780,10 +2780,11 @@ ENC-3: Opaque runtime-native objects, the base runtime_state blob (§15.5) and t
 
 15.3 Terrapin profile conformance vectors
 
-Computed by the reference oracle (real values, not illustrative). These constants
-are load-bearing and PROVISIONAL until independently reproduced by a second
-implementation/oracle (ENC-CONF-2); they MUST be cross-checked before §15 is
-frozen for release.
+CROSS-CONFIRMED (ENC-CONF-2 satisfied): every vector below was reproduced
+byte-for-byte by two independent v0.3 implementations, terrapin-rs (Rust,
+streaming/parallel) and terrapin-go (Go, in-memory plus a streaming reader for the
+128 GiB cases), and both agree with these values. The two have independent canonical
+manifest encoders, so this also rules out silent manifest divergence.
 
   Constants:
     G(empty)                = 473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813
@@ -2798,6 +2799,18 @@ frozen for release.
     block+1 (2097153 zero)  = 5ba8049ae8f68a47acd4fad265c8a963aa82735e90f209dd79ff8d6d2188fdc5
     128 GiB zero (65536 blk)= 8d03319328c6d6b3cd00566d894443b2a82d31437b580ee533c2021d82bdb5a4
     128 GiB + 1 byte        = 6f552f944f4995878c7facc92c29c3643aaafc2a5bff90e255bbf430210d551b
+
+  Per-level all-zero subtree roots (SPARSE-8; Z_0 = G(2 MiB zero block); Z_L =
+  G(Z_{L-1} repeated 65536 times), i.e. one full 2 MiB hash-file block of the lower
+  level, fanout = 2097152/32 = 65536):
+    Z_0 (leaf, <= 2 MiB)        = 67cbed9b97ddabde2863f4daefa4f57176567a7c3ccfa1560c1065f9c8af74d6
+    Z_1 (<= 128 GiB)            = 9e7e7e12b71c2b008302a4e4f5abe5b012025a8bd59d9ea5aa187f187a165599
+    Z_2 (<= 8 PiB)              = a9b835a482cdf112d81ee77942204e5a96895fc14907bd6f049b66d3e43e42eb
+    Z_3 (<= 512 EiB, full u64)  = 96df0f67df694e2f6cbbfb1b978415dc51b3000956d4e09bcd5dea1031129e35
+  Z_0 and Z_1 are vector-validated: Z_0 equals the G(2 MiB zero block) constant, and
+  Z_1 is the tree root of the 128 GiB zero vector (G(manifest(137438953472, Z_1))
+  equals the 128 GiB identifier above). Z_2 and Z_3 follow from the same node-hash
+  recurrence over the agreed G; both oracles compute them identically.
 
 Manifest accept/reject (canonical Terrapin manifest, §2.2): a manifest MUST be
 ASCII, LF-terminated (including the last line), field order exactly terrapin,
