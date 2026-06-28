@@ -84,3 +84,15 @@ Running discrete load tests and storing the results in a database.
 This will require setting up a Service Account to push results to a
 GCS bucket and a controller script to strictly orchestrate the locust
 invocation(s), make observations against Prometheus, then push the results.
+
+## LLIFS density-gate prototype
+
+`density_smoke.c` is a standalone proof of the LLIFS rung-3 density primitive
+(shared `MAP_PRIVATE` base + copy-on-write + userfaultfd absent-not-zero /
+known-zero-without-fetch). Build and run on Linux:
+
+    gcc -O2 -pthread -o density_smoke density_smoke.c && ./density_smoke
+
+`density-prototype-findings.md` records the results, the gVisor `MemoryFile`
+(`GVISOR-3`) patch point, and the native gVisor build prerequisites. See
+`docs/llifs.spec` §16.1 for how this maps to the Phase-1 acceptance test.
