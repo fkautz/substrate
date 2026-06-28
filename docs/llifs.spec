@@ -1,15 +1,98 @@
 LLIFS Specification
 
-Status: Draft (v1.0-draft) — complete. All sections (§§1–17) drafted, section-reviewed, and reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact). Known pre-release task: independently reproduce the §15.3 Terrapin conformance vectors via a second oracle.
-System: LLIFS — a verified, deduped, lazily-faulted state substrate for high-density agent FaaS.
-Primary target: gVisor (runsc) checkpoint/restore; Firecracker microVM next. One content-addressed, Terrapin-verified store delivers two state planes — a filesystem plane and a memory plane.
+Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). Phase 1 prototyping is green-lit from this draft. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): add the runtime delta (done in this draft, pending implementation proof); independently reproduce the §15.3 Terrapin conformance vectors via a second oracle (ENC-CONF-2); and reconcile the §15.8 LLWI1 field set against atelet.WorkloadSpec (ENC-WI-1) - a workload-identity mismatch is a restore-safety bug.
+System: LLIFS (a verified, deduped, lazily-faulted state substrate for high-density agent FaaS).
+Primary target: gVisor (runsc) checkpoint/restore; Firecracker microVM next. One content-addressed, Terrapin-verified store delivers two state planes: a filesystem plane and a memory plane.
 External identity: OCI-compatible sha256.
 Internal identity: terrapin-sha256, profile llifs-terrapin-sha256-v2.
 Dependency: Terrapin Specification v0.3 (the hashing primitive). Its profile parameters and the load-bearing conformance constants are inlined here (§2.2, §15); the algorithm itself is normative-by-reference.
 
-This is the single normative specification for LLIFS. It consolidates the previously separate documents into one; all cross-references are internal section references.
+⸻
 
-Core thesis: do not optimize "pull the whole state faster." Start the workload after fetching only the bytes required for useful execution, while verifying every exposed byte. At agent-FaaS scale a million near-identical agents become one shared, verified base plus a small per-agent delta. The decisive density mechanism is sharing one verified base — filesystem and memory — across agents, with only the per-agent overlay (and its persisted delta) private.
+Introduction
+
+LLIFS is the storage and state-management layer for running very large numbers
+of sandboxed agent workloads on a single fleet. It exists to make two things
+simultaneously true: a sandbox starts in roughly the time it takes to fault in
+the few blocks it actually touches, and every byte the sandbox is ever shown
+has been cryptographically verified against a trusted identity before execution
+sees it. Fast start and verified state are not traded off against each other;
+the design delivers both at once.
+
+The setting is agent FaaS: thousands to millions of agent instances that are
+near-identical, the same base image and the same warmed runtime (interpreter,
+framework, model client), differing only in a small amount of per-agent state.
+Treating each instance as an independent copy of a full filesystem and a full
+memory image does not scale. It is too slow to start, because you move whole
+images before the first useful instruction runs, and too expensive to keep,
+because you store the same bytes a million times. The core thesis follows from
+this: do not optimize "pull the whole state faster." Start the workload after
+fetching only the bytes required for useful execution, while verifying every
+exposed byte, and make the shared part genuinely shared so that a million
+near-identical agents collapse to one verified base plus a small per-agent
+delta.
+
+The approach. LLIFS keeps exactly one verified, content-addressed copy of each
+distinct byte-range and composes every sandbox from a shared base plus a small
+private overlay:
+
+  - Two state planes. A filesystem plane (the rootfs the workload reads and
+    writes) and a memory plane (a warmed guest-memory image a sandbox restores
+    from). Both are built from one content-addressed store.
+  - Lazy, verified fault-in. Bytes are fetched and verified in fixed blocks on
+    demand, so a workload begins as soon as the blocks on its startup path are
+    present, not after a whole image transfers. Nothing reaches the workload
+    until its containing block has verified (§8).
+  - Shared copy-on-write base. One base filesystem and one base memory snapshot
+    back many sandboxes; only the files and pages an agent actually changes
+    become private (§4.5, §5, §6).
+  - Content-addressed identity end to end. Every internal object is named by
+    its content (§2), so identical content is automatically a single object;
+    this is what collapses near-identical agents into one base plus deltas.
+  - A per-snapshot State Root. The complete, restorable identity of one agent
+    snapshot (its base, its memory delta, its filesystem delta, its runtime delta,
+    and the runtime it is pinned to) is itself a single content-addressed value with a
+    parent pointer, giving a lineage DAG and cheap forking (§6).
+
+Two identity planes. LLIFS speaks two digest "languages" and never confuses
+them (§2). The external plane is OCI-compatible sha256, so images, registries,
+scanners, signatures, and admission policy interoperate unchanged. The internal
+plane is terrapin-sha256 (profile llifs-terrapin-sha256-v2): the verified,
+length-bound, tree-structured identity over which all fetch, dedup, and
+copy-on-write decisions are made. Terrapin itself, the hashing primitive, is a
+separate dependency; this document inlines only its profile parameters and
+load-bearing constants (§2.2, §15) and references the algorithm normatively.
+
+Primary target. The first runtime is gVisor (runsc) checkpoint/restore, with
+Firecracker microVMs as the next adapter (§11). The design reuses existing
+runtime restore machinery wherever it can; the one capability it needs that
+does not exist yet (a shared copy-on-write memory base) is stated as a
+runtime requirement (§5, §11).
+
+What this document is. This is the single normative specification for LLIFS. It
+defines the object model and identity scheme (§2), the two state planes (§§3-5),
+the agent lifecycle (snapshot, reset, hibernate, yield, resume, and fork)
+(§§6-7), the distribution, caching, and garbage-collection model (§§8-10), the
+control-plane binding (§12), the security model (§14), and, so that independent
+implementations agree byte-for-byte, the canonical on-the-wire encodings and
+conformance vectors (§15). It consolidates a family of earlier design documents
+into one; all cross-references are internal section references.
+
+What this document is not. It does not define the Terrapin hashing algorithm (a
+referenced dependency), a scheduler or registry implementation, or any
+deployment-specific policy. Items the operator must supply are called out as
+out of scope (§14.4). The requirement keywords are normative per §1.
+
+How to read it. Read this introduction, then §1 (normative language) and §2
+(identity and the canonical vocabulary). §2 and the glossary (§17) are the
+terminology anchor for the whole document: every other section uses those terms
+and no synonyms. From there, §§3-5 define the filesystem and memory planes;
+§§6-7 the agent lifecycle, State Root, fork, and resume; §§8-10 fetch,
+verification, caching, GC, and scheduling; §§11-13 runtime adapters,
+control-plane binding, and observability; §14 the security model; §15 the
+canonical encodings and conformance vectors (the conformance surface for an
+implementation); §16 the phasing and minimum viable surface; and §17 the
+glossary.
 
 ⸻
 
@@ -52,17 +135,18 @@ canonical terms defined in §2.3 and §17, and no synonyms.
 
 2.1 Two digest planes
 
-External digest plane — for compatibility with OCI registries, descriptors,
+External digest plane: for compatibility with OCI registries, descriptors,
 image manifests/indexes, config and layer blobs, OCI artifact descriptors, scanners,
 SBOMs, signatures, and admission policy. The external digest algorithm is
 sha256.
 
-Internal digest plane — for LLIFS-native identity and verification. The internal
+Internal digest plane: for LLIFS-native identity and verification. The internal
 digest algorithm is terrapin-sha256, profile llifs-terrapin-sha256-v2. It is the
 identity of every internal object: content objects, base memory snapshots, base
 descriptors, deltas, State Roots, the logical rootfs tree and physical layout
-encodings, the runtime-state blob, startup-cohesion objects (§4.4), and proof
-blocks. Local cache keys (§9) are
+encodings, and the runtime-state blob (startup cohesion is reserved in v1, §4.4).
+(Hash-file/proof blocks are not separate objects: they are the level >= 1 blocks of
+an owning object, verified through its tree, TERRAPIN-6.) Local cache keys (§9) are
 DERIVED from these identifiers (directly, or HMAC-keyed per cache domain); they
 are not themselves objects.
 
@@ -122,7 +206,7 @@ TERRAPIN-3:
   The fixed 2 MiB block is the unit of fetch and verification (a "block", §2.3).
   No sub-block proofs and no sub-2-MiB profile are defined; finer granularity, if
   ever needed, is a separate profile justified by measured over-fetch, never by a
-  desire for finer dedup (dedup is achieved structurally — §2.3, §4, §5).
+  desire for finer dedup (dedup is achieved structurally: §2.3, §4, §5).
 TERRAPIN-4:
   Bytes MUST NOT be exposed to a workload until the containing block has verified
   against a trusted Terrapin identifier. Peers, mirrors, registries, caches, and
@@ -132,6 +216,14 @@ TERRAPIN-5:
   is the leaf and the tree root is G(data). Only multi-block objects carry
   level >= 1 hash-file blocks; one 2 MiB level-1 block authenticates up to a
   128 GiB contiguous region.
+TERRAPIN-6:
+  Hash-file/proof blocks are NOT independent objects: they are the level >= 1
+  blocks of an owning Terrapin object, addressed by BlockRef (object / level /
+  blockIndex, §2.3 block) and verified through that object's manifest and tree.
+  Only the object classes of §2.3 (and the structural plane objects of §2.3 intro)
+  are Terrapin objects with their own identifier; data blocks (level 0) and proof
+  blocks (level >= 1) are addressed under those objects and have no identifier of
+  their own.
 
 ⸻
 
@@ -139,21 +231,23 @@ TERRAPIN-5:
 
 These are the canonical nouns for agent state, and the only terms this document
 uses for it. Two adjacent categories are deliberately NOT in this list and are
-not agent-state object classes: (a) STRUCTURAL plane objects — the logical rootfs
-tree encoding (§3), the physical layout encoding (§4), the runtime-state blob and
-memory layout (§5), and Terrapin proof blocks — which are also Terrapin objects,
-each defined in its own section; and (b) COMMITTED FIELDS — sandbox pin, workload
-identity, run mode, and producer — which are committed inside a descriptor or a
-State Root, not stored as standalone objects. Local cache keys (§9) are derived,
-not objects. Synonyms used in earlier drafts (chunk, chunk map, artifact, plane
+not agent-state object classes: (a) STRUCTURAL plane objects: the logical rootfs
+tree encoding (§3), the physical layout encoding (§4), and the runtime-state blob
+and memory layout (§5), which are Terrapin objects, each defined in its own
+section; and (b) COMMITTED FIELDS: sandbox pin, workload identity, run mode, and
+producer, which are committed inside a descriptor or a State Root, not stored as
+standalone objects. Terrapin proof (hash-file) blocks are NOT objects: they are
+the level >= 1 blocks of an owning object, addressed by BlockRef and verified
+through that object's manifest/tree (§2.2 TERRAPIN-6), never independently
+identified. Local cache keys (§9) are derived, not objects. Synonyms used in earlier drafts (chunk, chunk map, artifact, plane
 manifest, opaque checkpoint, golden memory as a distinct object) are retired; see
 the Glossary (§17) for the mapping.
 
 block
-  A 2,097,152-byte Terrapin data block (the final block of an object MAY be
-  short). The unit of fetch and verification into the node CAS. A block is
-  addressed within an object as object-digest / level / blockIndex; it has no
-  independent identifier.
+  A 2,097,152-byte Terrapin block (the final block of a level MAY be short): data
+  at level 0, hash-file/proof at level 1+. The unit of fetch and verification into
+  the node CAS. A block is addressed within an object as object-digest / level /
+  blockIndex (a BlockRef); it has no independent identifier (TERRAPIN-6).
 
 content object
   A Terrapin object whose bytes are exactly the content of one logical regular
@@ -166,8 +260,8 @@ content object
 
 base rootfs
   The read-only, deduped filesystem base. It is (a) a canonical logical rootfs
-  tree — paths, types, modes, owners, mtimes, xattrs, symlink/device/FIFO nodes,
-  hardlink groups — encoded as LLT1, yielding the logicalRootfsDigest (§3); and
+  tree: paths, types, modes, owners, mtimes, xattrs, symlink/device/FIFO nodes,
+  hardlink groups, encoded as LLT1, yielding the logicalRootfsDigest (§3); and
   (b) that tree's regular-file content realized as content objects via the
   content-addressed physical layout LLAY1, yielding the layoutDigest (§4). Shared
   across agents within a cache domain.
@@ -200,35 +294,37 @@ overlay
 
 delta
   The persisted, content-addressed snapshot of an overlay, captured at hibernate
-  or fork. It has two parts. The MEMORY DELTA is a page MAP: for each diverged
-  guest page, the source of its bytes (this delta's data object, the parent's, the
+  or fork. It has three parts. The MEMORY DELTA is a page MAP: for each diverged
+  guest page, the source of its bytes (this delta's data object, an ancestor's, the
   base, or the canonical zero) and range, so every page resolves by direct
   reference with no ancestor traversal (§6.3) and a fork shares parent/base pages
   zero-copy (§15 LLMD1). The FILESYSTEM DELTA is a canonical overlay-delta object
   that reconstructs the writable upper completely: content-object references for
-  changed regular-file data, plus every overlay namespace and metadata operation —
+  changed regular-file data, plus every overlay namespace and metadata operation:
   created/changed directories, symlinks, device and FIFO nodes,
   ownership/mode/mtime/xattr changes, renames, and deletions (whiteouts/
   tombstones). (Copy-up breaks hardlink identity, as in default OverlayFS; the
-  delta records files by content, not hardlink groups — §15 LLFD1.) A delta is
-  per-agent and private: it lives in per-cache-domain-keyed CAS and is not deduped
-  across cache domains.
+  delta records files by content, not hardlink groups: §15 LLFD1.) The RUNTIME DELTA
+  is an opaque runtime-native object capturing the diverged non-memory runtime state
+  required for exact process resume (DELTA-2R, §15 LLRD1). A delta is per-agent and
+  private: it lives in per-cache-domain-keyed CAS and is not deduped across cache
+  domains.
 
 State Root
   The content-addressed identity of one persisted agent snapshot. It is a
   Terrapin object whose canonical encoding (§15) binds: the actor identity; a base
-  descriptor reference; a memory delta reference; a filesystem delta reference; the
-  sandbox pin; the workload identity; the run mode; the producer; the production
-  time; and a parent State Root reference (the lineage edge). A State Root is minted at suspend, hibernate, or
-  fork — never for a merely-running agent (whose live per-agent state is an
+  descriptor reference; a memory delta reference; a filesystem delta reference; a
+  runtime delta reference; the sandbox pin; the workload identity; the run mode; the
+  producer; the production time; and a parent State Root reference (the lineage edge). A State Root is minted at suspend, hibernate, or
+  fork, never for a merely-running agent (whose live per-agent state is an
   ephemeral overlay). It is the unit of resume identity and of forking.
 
 lineage
   The parent-pointer DAG over State Roots. Because a State Root's encoding
   commits its parent, a State Root identifier transitively commits to its
   ancestry. A fork creates a child State Root whose parent is the source snapshot
-  and whose memory and filesystem deltas begin as copy-on-write references to the
-  source State Root's delta components (§6).
+  and whose memory, filesystem, and runtime deltas begin as copy-on-write references
+  to the source State Root's delta components (§6).
 
 Relationships (informative):
 
@@ -238,16 +334,20 @@ Relationships (informative):
        │
   State Root (per-agent, runtime-attested) ──► parent State Root ──► … (lineage)
        │
-       ├─► memory delta      (page-indexed)         per-agent, private
-       └─► filesystem delta  (overlay-delta object) per-agent, private
+       ├─► memory delta      (page-indexed)          per-agent, private
+       ├─► filesystem delta  (overlay-delta object)  per-agent, private
+       └─► runtime delta     (opaque runtime-native) per-agent, private
 
   running agent   = base (shared, copy-on-write) + overlay (ephemeral, not stored)
-  persisted agent = State Root = base descriptor ref + delta + lineage
+  persisted agent = State Root = base descriptor ref + delta (memory + filesystem +
+                                 runtime) + lineage
 
 OBJ-1:
-  Every stored LLIFS object — an agent-state object (above) or a structural plane
-  object (§3, §4, §5, including Terrapin proof blocks) — MUST be a Terrapin object
-  identified per §2.2. Committed fields (§2.3 intro) are not separate objects.
+  Every stored LLIFS object, an agent-state object (above) or a structural plane
+  object (§3, §4, §5), MUST be a Terrapin object identified per §2.2. Hash-file/
+  proof blocks are not objects (they are the level >= 1 blocks of an owning object,
+  addressed by BlockRef, §2.2 TERRAPIN-6); committed fields (§2.3 intro) are not
+  separate objects.
 OBJ-2:
   A content object's identity MUST be over hole-expanded logical content bytes
   only; path, metadata, and hole structure MUST NOT affect it (§4).
@@ -261,10 +361,11 @@ OBJ-4:
   Root.
 OBJ-5:
   A State Root MUST commit actor, base descriptor, memory delta, filesystem delta,
-  sandbox pin, workload identity, run mode, producer, created, and parent; absent
-  components MUST be the explicit "none" value, never omitted (§15).
+  runtime delta, sandbox pin, workload identity, run mode, producer, created, and
+  parent; absent components MUST be the explicit "none" value, never omitted (§15).
 OBJ-6:
-  Identical objects (content objects, memory-delta and filesystem-delta
+  Identical objects (content objects, memory-delta, filesystem-delta, and
+  runtime-delta
   components, base objects) MUST dedupe to one CAS entry per cache domain (§9).
 
 ⸻
@@ -273,8 +374,8 @@ OBJ-6:
 
 LLIFS deliberately decouples two units that earlier designs conflated:
 
-  block (2 MiB) — the unit of fetch and verification into the node CAS.
-  page  (4 KiB) — the platform MMU page; the unit of per-agent copy-on-write
+  block (2 MiB): the unit of fetch and verification into the node CAS.
+  page  (4 KiB): the platform MMU page; the unit of per-agent copy-on-write
                   sharing for the memory plane.
 
 Dedup is achieved structurally, not by hashing ever-finer pieces:
@@ -304,14 +405,15 @@ single signature subject:
         → content objects
   base memory snapshot + runtime-state blob + memory layout + sandbox pin (§5)
     │
-    └── the signed base descriptor commits ALL of the above as one unit —
+    └── the signed base descriptor commits ALL of the above as one unit (
         OCI digest, logicalRootfsDigest, layoutDigest, base memory snapshot,
         runtime-state blob, memory layout, sandbox pin, compatibility matrix, and
-        assurance mode — so none can be recombined and the base memory snapshot
+        assurance mode) so none can be recombined and the base memory snapshot
         (not derivable from the rootfs digests) is bound to the same OCI subject.
 
-Runtime-attested regime (per-agent state). A memory delta, filesystem delta, and
-State Root are produced at runtime; they have no OCI subject and no builder.
+Runtime-attested regime (per-agent state). A memory delta, filesystem delta, runtime
+delta, and State Root are produced at runtime; they have no OCI subject and no
+builder.
 Their integrity is unchanged (Terrapin all the way down); their provenance anchor
 is a runtime ATTESTATION ENVELOPE:
 
@@ -320,8 +422,9 @@ is a runtime ATTESTATION ENVELOPE:
     the producer recorded in the State Root, or be authorized by policy to attest
     on that producer's behalf;
   - subject: the State Root identifier (which, being content-addressed,
-    transitively covers ALL committed State Root fields — actor, parent,
-    base-descriptor reference, both delta references, sandbox pin, workload
+    transitively covers ALL committed State Root fields: actor, parent,
+    base-descriptor reference, all three delta references (memory, filesystem,
+    runtime), sandbox pin, workload
     identity, run mode, producer, and created);
   - validation: a verifier MUST check the envelope signature against a configured
     runtime trust root before exposing any runtime-produced byte, AND MUST
@@ -406,8 +509,8 @@ MAT-6:  Absolute paths, paths containing a NUL byte, and paths containing ANY
 MAT-7:  Path normalization MUST, component-wise: (a) drop "." components;
         (b) collapse repeated "/" to a single "/"; (c) strip any trailing "/".
         It MUST NOT change the byte identity of valid components. The result is
-        relative to root — no leading "/", no trailing "/", single "/"
-        separators — and directory and file entries normalize identically.
+        relative to root (no leading "/", no trailing "/", single "/"
+        separators), and directory and file entries normalize identically.
 MAT-8:  Within and across layers, a later entry for the same normalized path
         replaces an earlier one, subject to whiteout/opaque semantics.
 MAT-9:  Whiteouts apply OCI semantics: ".wh.<name>" removes <name> from the
@@ -463,7 +566,7 @@ Primitive encodings (shared with LLAY1, §4.3):
   PRIM-3: varbytes = a length prefix followed by exactly that many raw bytes;
           path, symlink target, and xattr key/value use a u32 length prefix.
   PRIM-4: all multi-byte integers are little-endian regardless of host.
-  PRIM-5: a 32-byte digest field is the RAW Terrapin identifier — the 32-byte
+  PRIM-5: a 32-byte digest field is the RAW Terrapin identifier: the 32-byte
           G(manifest) payload itself, never the "terrapin-sha256:<hex>" string and
           never the bare recursive tree root. ("raw Terrapin identifier" / "raw
           TerrapinID" mean exactly this throughout §3 and §4.)
@@ -486,7 +589,7 @@ Document framing:
               same-path collisions per MAT-8 before encoding; the encoded LLT1
               tree is already collision-free).
 
-Entry record — common prefix (every entry, this exact order/width):
+Entry record, common prefix (every entry, this exact order/width):
 
   pathLen u32; path (pathLen bytes, normalized); type u8 (1=dir 2=regfile
   3=symlink 4=chardev 5=blockdev 6=fifo); mode u32 (low 12 bits significant);
@@ -496,7 +599,7 @@ Entry record — common prefix (every entry, this exact order/width):
 Type-specific tail (immediately after the prefix):
 
   regfile  : contentLen u64; contentId 32 bytes (raw TerrapinID of the content
-             object, §4.1 — not hex, not the bare tree root)
+             object, §4.1: not hex, not the bare tree root)
   symlink  : targetLen u32; target (raw link bytes, unresolved)
   chardev  : major u32; minor u32
   blockdev : major u32; minor u32
@@ -508,7 +611,7 @@ Type-specific tail (immediately after the prefix):
   LLT1-ENTRY-3: mtimeNsec >= 1_000_000_000 MUST reject.
   LLT1-ENTRY-4: for regfiles, contentLen MUST equal the content object's length
                 and contentId MUST be its 32-byte TerrapinID.
-  LLT1-ENTRY-5: mode MUST be (st_mode & 0o7777) — perms + setuid/setgid/sticky;
+  LLT1-ENTRY-5: mode MUST be (st_mode & 0o7777): perms + setuid/setgid/sticky;
                 type bits MUST be masked off (type is carried separately).
   LLT1-ENTRY-6: a hardlink materializes as a regfile sharing the target's content
                 object AND inode metadata (mode/uid/gid/mtime/xattrs); only path
@@ -549,7 +652,7 @@ path, linkpath, uid, gid, size, mtime, and SCHILY.xattr.*; GNU/PAX sparse header
 are NOT used for identity; tar type map: '0'/'\0'→regfile, '5'→dir, '2'→symlink,
 '1'→hardlink, '3'→chardev, '4'→blockdev, '6'→fifo, '7'→regfile, any other →
 reject. The tar parser MUST preserve raw path/linkname bytes including embedded
-NUL — truncating at NUL before the NUL rejection (MAT-6) fires is a
+NUL; truncating at NUL before the NUL rejection (MAT-6) fires is a
 path-confusion hazard.
 
 PAX numeric and timestamp canonicalization (these feed logicalRootfsDigest, so
@@ -588,17 +691,15 @@ the unit of cross-image dedup.
 4.1 Content objects
 
 CO-1: Every logical regular file MUST have exactly one content-object identifier
-      (§2.3) over its content bytes. The bytes are either stored as a CAS content
-      object or carried inline under SMALL-* (§4.1); either way the identity is
-      the same content-object identifier.
+      (§2.3) over its content bytes, and in v1 those bytes are stored as a CAS
+      content object under that identifier. (Inlining file bytes into the base
+      descriptor is reserved, not used in v1: SMALL-2.)
 CO-2: A content object's identifier MUST be terrapin-sha256 over the file's
       logical (hole-expanded) content bytes, independent of image, layer, path,
       mode, owner, mtime, or xattrs.
 CO-3: Two files with identical content MUST resolve to the same content-object
-      identifier. When the content is stored in (or promoted to) the CAS, within
-      a cache domain it MUST resolve to the same CAS entry, proof blocks, and
-      warmth credit; inlined-but-not-promoted bytes carry the identifier but no
-      CAS presence/warmth (SMALL-5).
+      identifier; within a cache domain they MUST resolve to the same CAS entry,
+      proof blocks, and warmth credit.
 CO-4: Hardlinked files MUST reference the same content object; hardlink group
       identity is a property of the logical tree (§3), not the content object.
 CO-5: A content object is blocked from offset 0 at the fixed 2 MiB size. A file
@@ -631,28 +732,41 @@ SPARSE-6: Runtime SEEK_HOLE/SEEK_DATA follows the canonical hole structure.
 SPARSE-7: A canonical zero range is a virtual verified-zero range derived from
           (zeroLeafDigest, length, cache domain); it requires no stored bytes and
           creates no ordinary object-root CAS identity, lease, or warmth.
+SPARSE-8: Virtual zero applies to PROOF blocks too, not just data. A hash-file/proof
+          block (level >= 1) whose entries are fully determined by canonical zero
+          subtrees MAY be represented virtually: it MUST NOT be stored or fetched, and
+          MUST verify byte-identically to the materialized Terrapin hash-file block it
+          stands for. This is required for very large sparse objects (notably the
+          guest-address-linear memory image, MEM-1, where a high-address mapped-data
+          block's proof siblings may be entirely zero subtrees): a verifier resolves
+          such proof blocks from the zero constant (§2.2), never the network. A
+          conformance vector MUST exercise a high-address mapped-data region behind a
+          large zero span (§15.10 ENC-CONF-2).
 
 Small files:
 
-SMALL-1: Implementations SHOULD treat every regular file as a content object
-         regardless of size, to maximize cross-image dedup of shared small files.
-SMALL-2: Implementations MAY inline files below a configurable threshold
-         (recommended default 16384 bytes). Inline bytes MUST be carried in a
-         signed, Terrapin-identified inline region of the base descriptor (not
-         loose metadata); the region is committed by the base descriptor and
-         reachable from its trust root (§2.5).
-SMALL-3: Inlined files MUST still be identified by their content-object
-         identifier (terrapin-sha256 of content); LLAY1 commits this identity via
-         InlineRecord.contentDigest. Before exposing inline bytes, imagefsd MUST
-         verify terrapin-sha256(inline bytes) == InlineRecord.contentDigest, so an
-         identical file inlined in one image and stored as an object in another is
-         verifiable under one identity (DIGEST-BIND-6).
-SMALL-4: Grouping multiple distinct files into one object MUST NOT be used as a
-         dedup mechanism (group identity depends on all members).
-SMALL-5: Inlined bytes are authenticated by the signed inline region (SMALL-2)
-         that carries them; they create no CAS presence, lease, or warmth until
-         promoted to
-         canonical CAS under the content-object key.
+SMALL-1: Every regular file MUST be a content object regardless of size (a tiny file
+         is one short block, CO-5), maximizing cross-image dedup of shared small
+         files. Startup latency from many small files is addressed in the transport
+         plane by packs (§7; startup cohesion is reserved in v1, §4.4), NOT by
+         changing file identity.
+SMALL-2: Inlining file bytes into the base descriptor is RESERVED and MUST NOT be
+         used in v1. Rationale: it defeats dedup for the highest-fan-out small files
+         (an inlined stream earns no CAS presence or warmth, working against the
+         density thesis), bloats the hot, must-verify-on-every-restore base
+         descriptor, and couples profiling to base identity (the separation §4.4
+         COH-3 and LAYOUT-5 establish). If ever reintroduced, inline bytes MUST be a
+         bootstrap-bundled Terrapin object that preserves content-object identity and
+         CAS promotion, never raw bytes committed into LLBD1.
+SMALL-3: (Reserved with SMALL-2.) Were inline reintroduced, an inlined file would
+         still be identified by its content-object identifier and verified
+         (terrapin-sha256(bytes) == the committed contentDigest) before exposure
+         (DIGEST-BIND-6).
+SMALL-4: Grouping multiple distinct files into one object MUST NOT be used as a dedup
+         mechanism (group identity depends on all members). A startup-cohesion object
+         (reserved in v1, §4.4) would likewise be a transport optimization with no
+         dedup or identity role, not such a grouping.
+SMALL-5: (Reserved with SMALL-2.)
 
 ⸻
 
@@ -692,9 +806,10 @@ Document framing:
   fileCount u64 + FileLayouts (sorted by normalized path bytes);
   inlineCount u64 + InlineRecords (sorted by path).
 
-  (Startup-cohesion objects are NOT part of LLAY1 / layoutDigest — see §4.4. They
-  are a profiler-driven transport optimization committed by the startup profile/
-  pack (§7), so re-profiling never changes layoutDigest, per LAYOUT-5.)
+  (Startup-cohesion objects, reserved in v1 (§4.4), are in any case NOT part of
+  LLAY1 / layoutDigest: were they defined they would be a profiler-driven transport
+  optimization committed by the startup profile/pack (§7), never changing
+  layoutDigest, per LAYOUT-5.)
 
   ObjectDescriptor: digest 32; blockSize u64 (2097152); length u64; tree 32;
                     class u8 (1=content object; other values reserved, MUST reject
@@ -703,8 +818,8 @@ Document framing:
               that backing value and nothing else (no sentinel/placeholder for the
               non-applicable index):
                 backing==1 (object): objectIndex u64; extentCount u32; extents.
-                backing==2 (inline): inlineIndex u64; (extentCount u32 = 0; no
-                                     extents).
+                backing==2 (inline, RESERVED in v1, LLAY1-11): inlineIndex u64;
+                                     (extentCount u32 = 0; no extents).
                 backing==3 (empty):  (extentCount u32 = 0; no extents; no index).
   Extent: kind u8 (1=data 2=virtual-zero); objectOffset u64; fileOffset u64;
           length u64.
@@ -729,7 +844,7 @@ Document framing:
   LLAY1-6: backing==3 (empty file) has size 0 and no extents; hardlinked files
            share one objectIndex.
   LLAY1-7: layoutDigest MUST commit layoutFn, implementsLogical, all object
-           descriptors, all file layouts/extents, and all inline records — and
+           descriptors, all file layouts/extents, and all inline records, and
            nothing about fetch order, pack/cohesion membership, cache state, or
            peer availability (LAYOUT-5).
   LLAY1-8: unknown values of backing, Extent.kind, or ObjectDescriptor.class MUST
@@ -744,25 +859,35 @@ Document framing:
            FileLayout.objectIndex, and every InlineRecord by at least one
            FileLayout.inlineIndex; unreferenced descriptors or inline records MUST
            reject (no unreachable records may perturb layoutDigest).
+  LLAY1-11: Inline backing is RESERVED in v1 (SMALL-2): inlineCount MUST be 0, no
+           InlineRecords may be present, and backing==2 MUST reject. The inlineCount
+           field, the InlineRecord layout, and backing==2 are retained for
+           forward-compatibility only.
 
 ⸻
 
-4.4 Startup cohesion (optional)
+4.4 Startup cohesion (reserved in v1)
 
-An implementation MAY emit a per-image startup-cohesion object that concatenates
-startup-critical small-file bytes for minimal startup block count.
+A startup-cohesion object would concatenate startup-critical small-file bytes into
+fewer, larger blocks to cut per-block startup overhead. It is RESERVED and MUST NOT
+be emitted in v1: serving file bytes from a concatenated object requires a committed
+segment map (content-object id, file offset, cohesion object id, cohesion offset,
+length) and per-segment rules proving each served segment against its original
+content-object identity, which v1 does not define. The v1 mechanism for startup
+small-file fragmentation is the PACK (§7): a pack batches the startup working set of
+canonical content-object blocks into one fetch, with no alternate byte carrier and
+no new identity.
 
-COH-1: A cohesion object MUST NOT receive dedup or cross-image warmth credit; it
-       is a per-image latency optimization for hot bytes only.
-COH-2: The same content MUST remain addressable by its content-object identifier
-       for cold reads and for nodes that did not fetch the cohesion object; a
-       cohesion object is additive, never the sole source of truth.
-COH-3: Whether to emit a cohesion object SHOULD be decided by the profiler (§7)
-       from measured startup small-file fragmentation, and MUST be reported.
-COH-4: A cohesion object is NOT part of physical layout identity: it MUST NOT
-       appear in LLAY1 / layoutDigest (§4.3). It is committed by the startup
-       profile/pack (§7), so a profiler decision changes the startup schedule but
-       never the layoutDigest for the same files (LAYOUT-5).
+COH-1: Startup cohesion MUST NOT be emitted in v1. If introduced later it MUST be a
+       named structural object (LLCOH1) with a canonical segment map and explicit
+       rules that every served segment verifies against its original content-object
+       identity before exposure (DIGEST-BIND-6).
+COH-2: A cohesion object, if ever defined, MUST NOT receive dedup or cross-image
+       warmth credit and MUST be additive only: the same content MUST remain
+       addressable by its content-object identifier, never sole-sourced from it.
+COH-3: A cohesion object, if ever defined, MUST NOT be part of physical layout
+       identity (MUST NOT appear in LLAY1 / layoutDigest, §4.3) and MUST be committed
+       by the startup profile/pack (§7), so it never changes layoutDigest (LAYOUT-5).
 
 ⸻
 
@@ -807,7 +932,7 @@ COPYUP-4: Copy-up full-file fetches MUST be measured separately from ordinary
 
 5. Memory plane: base snapshot, copy-on-write restore, restore hazards
 
-The filesystem plane (§§3–4) delivers verified, deduped, lazily-faulted files.
+The filesystem plane (§§3-4) delivers verified, deduped, lazily-faulted files.
 The memory plane delivers the same for guest memory: a verified, deduped,
 lazily-faulted base memory snapshot from which sandboxes restore, sharing the base
 copy-on-write so a million agents are one shared base plus a small per-agent
@@ -822,13 +947,20 @@ A base memory snapshot is captured once from a warmed sandbox (interpreter,
 framework, and client loaded; paused at a restore point) and committed by a base
 descriptor (§2.3, §2.5). The base descriptor commits: the base memory snapshot
 OBJECT (the guest memory image, a Terrapin object, §5.3); the runtime-state blob
-(non-memory sandbox state — threads, fds, namespaces, vCPU/sentry state — needed
+(non-memory sandbox state: threads, fds, namespaces, vCPU/sentry state, needed
 to resume); and the memory layout (guest-address → object-offset mapping, §5.3).
 A restore working set (§5.5) is associated PROFILE metadata keyed to the base
 version, not a committed base-descriptor field.
 
 MEM-1: The base memory snapshot object identifier MUST be terrapin-sha256 over the
-       canonical memory image bytes.
+       canonical HOLE-EXPANDED, guest-address-linear byte image of the committed
+       guest address space [0, committedEnd), committedEnd being the end of the
+       highest region in the memory layout (§15.5 ENC-ML-1). Byte offset O in this
+       image is guest offset O (MLAYOUT-1). Mapped-data ranges contribute their
+       captured bytes; mapped-zero and unmapped/no-access ranges contribute
+       canonical zeros. Identity is over LOGICAL bytes, computed with the canonical
+       zero-block shortcut (the §4 SPARSE rule on the memory plane), so it is
+       independent of physical sparseness and never materializes zero ranges.
 MEM-2: The base is captured once per base version, hashed, and signed. Producers
        are NOT required to reproducibly regenerate an identical image; identity is
        "snapshot once, content-address the result." (Contrast MAT-20: the
@@ -839,6 +971,13 @@ MEM-4: In addition to the full base-descriptor binding of DIGEST-BIND-3, the
        runtime-state blob and memory layout MUST be committed by the base
        descriptor so the (memory + state + layout) triple cannot be recombined
        across bases.
+MEM-5: The MEM-1 identity commits LOGICAL bytes and does NOT encode mapping state:
+       a mapped-zero range and an unmapped/no-access range hash identically (both
+       zeros). Per-range mapping STATE (§5.3 MLAYOUT-5) is committed ONLY by the
+       signed memory layout, which the base descriptor binds (MEM-4, DIGEST-BIND-3).
+       Restore MUST derive every range's state from the signed layout and MUST NOT
+       infer state from snapshot bytes; two snapshots with identical base_memory but
+       different layout STATE are different bases.
 
 ⸻
 
@@ -857,7 +996,7 @@ GRAN-3: Once a 2 MiB base block is verified-resident in the node CAS, its pages
 GRAN-4: Implementations MUST NOT introduce a sub-2-MiB memory profile unless
         measured cold-node over-fetch (§5.5) justifies it; if justified, a finer
         profile MAY be defined separately and MUST be reported in telemetry. Page
-        dedup MUST NOT be the justification — dedup is achieved by base sharing
+        dedup MUST NOT be the justification; dedup is achieved by base sharing
         (§5.4), not by content-addressing each agent's pages.
 
 ⸻
@@ -869,15 +1008,21 @@ stored object the way file bytes may be repacked (§4). The base memory snapshot
 object is stored in guest-address-linear order, which is both canonical for dedup
 and trivially MAP_PRIVATE-mappable as one linear region.
 
-MLAYOUT-1: Stored in guest-address-linear order: object offset O corresponds to
-           guest offset O within a captured region.
+MLAYOUT-1: Guest-address-linear: in the canonical hole-expanded image (MEM-1) byte
+           offset O is guest offset O across the whole committed space
+           [0, committedEnd), not merely within one region. Physical storage MAY be
+           sparse (holes for zero, unmapped, and not-yet-fetched ranges); logical
+           offsets are unaffected.
 MLAYOUT-2: A base memory snapshot is exactly ONE Terrapin object (§2.3); multiple
-           objects MUST NOT be used. The memory layout describes the guest regions,
-           gaps, and per-range state WITHIN that single object. Mapped-data regions
-           are dense (each a linear MAP_PRIVATE mapping) and consume stored object
-           bytes (resident only after fetch); mapped-zero, gap, and unmapped ranges
-           consume no stored bytes but are NOT physically compacted out (that would
-           break linear mapping). The layout MUST be deterministic.
+           objects MUST NOT be used. Its IDENTITY is the hole-expanded logical byte
+           image of MEM-1; its PHYSICAL storage is sparse. The memory layout
+           describes the guest regions and per-range state over that one object.
+           Mapped-data ranges occupy stored object bytes (resident only after fetch
+           and verify). Mapped-zero and unmapped/no-access ranges are logical holes:
+           they contribute canonical zeros to identity (MEM-1) but occupy NO stored
+           or transferred bytes, and they keep their guest offsets (NOT compacted
+           out) so the image remains one linear MAP_PRIVATE region (MLAYOUT-1). The
+           layout MUST be deterministic.
 MLAYOUT-3: Restore ordering MUST be expressed only as a fetch schedule (§5.5),
            never as a permutation of the stored object (MLAYOUT-1).
 MLAYOUT-4: The memory layout MUST commit the guest-region → object-extent mapping
@@ -953,7 +1098,7 @@ COW-6:  Absent base ranges MUST be protected so they cannot resolve to zero-fill
         handler, fetch and verify the containing block at P0, ADMIT the verified
         block into the node CAS / shared base backing, then map or continue the
         faulting page from that verified shared backing (preserving the shared-base
-        invariant COW-1/COW-3 — never a per-sandbox unverified copy), and only then
+        invariant COW-1/COW-3, never a per-sandbox unverified copy), and only then
         resume the faulting thread. A read of an absent range MUST block, never
         return zeros.
 COW-6a: Absent (not-yet-fetched) ranges require userfaultfd MISSING-fault handling
@@ -1042,7 +1187,8 @@ RHAZARD-7: Before HAZARDS_CLEARED for multi-tenant restore, each of the followin
   BASE_UNRESOLVED
     → BASE_RESOLVED              (signed base descriptor verified)
     → BASE_STARTUP_PREHYDRATED   (restore working set resident and verified)
-    → RESTORED                   (sandbox mapped CoW, runtime-state applied)
+    → RESTORED                   (sandbox mapped CoW; base runtime-state then
+                                  runtime delta applied, RDELTA-5)
     → HAZARDS_CLEARED            (RHAZARD-1..7 refreshed)
     → RUNNING
 
@@ -1067,14 +1213,15 @@ upper) and §5 (base memory snapshot, copy-on-write restore, restore hazards).
 
 While an agent runs, its per-agent state is an OVERLAY (§2.3): copy-on-write dirty
 guest-memory pages (§5.4) plus the writable filesystem upper (§4.5). The overlay
-is ephemeral — it lives in RAM and node-local scratch, is never written to the
+is ephemeral; it lives in RAM and node-local scratch, is never written to the
 shared CAS, and earns no dedup or warmth (COW-2, MOUNT-3).
 
 At suspend, hibernate, or fork, the overlay is captured into a DELTA (§2.3): a
-persisted, content-addressed, per-agent object with two parts.
+persisted, content-addressed, per-agent object with three parts (memory,
+filesystem, and runtime).
 
 DELTA-1: The MEMORY DELTA MUST be a page MAP: for each diverged guest page, the
-         source of its bytes (this delta's own data object, the parent's, the base,
+         source of its bytes (this delta's own data object, an ancestor's, the base,
          or the canonical zero) and range. The map directly resolves every page, so
          resume needs no ancestor traversal (§6.3 LINEAGE-3) and a fork shares
          parent/base pages by direct reference with no copy. Pages identical to the
@@ -1082,27 +1229,65 @@ DELTA-1: The MEMORY DELTA MUST be a page MAP: for each diverged guest page, the
          listed. Its byte encoding is §15 (LLMD1).
 DELTA-2: The FILESYSTEM DELTA MUST be the canonical overlay-delta object (§2.3,
          §15): content-object references for changed regular-file data, plus every
-         overlay namespace and metadata operation — created/changed directories,
+         overlay namespace and metadata operation: created/changed directories,
          symlinks, device and FIFO nodes, ownership/mode/mtime/xattr changes,
          renames, and deletions (whiteouts/tombstones). It MUST be sufficient to
          reconstruct the writable upper exactly. Hardlink identity in the upper is
          NOT preserved across copy-up (as in default OverlayFS): copied-up files are
          recorded by content, not as a hardlink group; restoring hardlink identity
          is a future extension.
+DELTA-2R: The RUNTIME DELTA captures the agent's diverged NON-memory, non-filesystem
+         runtime state: the runtime-native execution state the base runtime-state blob
+         (§5.1) no longer describes after the agent has run, and which guest memory
+         alone does not reconstruct (for gVisor e.g. thread/register state, fd tables
+         and offsets, epoll/timer/signal/futex/rseq/TLS state, syscall-restart state,
+         VMA metadata, socket state, and sentry/kernel bookkeeping). A memory delta
+         plus filesystem delta cannot restore a non-cooperating process hibernated
+         mid-request or yielded while blocked upstream; the runtime delta is what
+         makes that exact. For v1 it is an OPAQUE runtime-native Terrapin object, like
+         the base runtime-state blob; LLIFS defines no internal structure (§15 LLRD1).
+         Its encoding MAY later be optimized into a delta against the base
+         runtime-state blob; correctness comes first.
 DELTA-3: A delta is per-agent and private: it MUST live in per-cache-domain-keyed
          CAS and MUST NOT be deduped across cache domains (§9). Each delta
          component is a Terrapin object verified before exposure (DIGEST-BIND-6).
 DELTA-4: Capturing the overlay MUST occur under the single freeze barrier (WRITE-1)
-         so the memory delta and filesystem delta share one freeze epoch; restore
-         MUST present a coherent memory↔filesystem view (no mmap'd working-plane
-         page may reflect a different epoch than the memory delta).
+         so the memory, filesystem, and runtime deltas share one freeze epoch;
+         restore MUST present a coherent memory↔filesystem↔runtime view (no mmap'd
+         working-plane page may reflect a different epoch than the memory delta).
+DELTA-5: A persisted delta (memory, filesystem, or runtime) MUST be directly
+         resolvable on
+         the resume critical path: every object it needs is named by absolute
+         Terrapin id and read directly, with NO ancestor or lineage traversal
+         (LINEAGE-3, §6.3 FORK-3). Storage MAY share ancestor objects zero-copy, and
+         a named ancestor OBJECT (the base via base_ref, or an LLMD1 source==2
+         ancestor delta-data object) is a DIRECT resolution input read without
+         traversal. The lineage LINKS proper, the parent State Root and an LLFD1
+         parent_ref, are provenance, authorization, GC, or compaction inputs ONLY;
+         the resume-critical resolved form (direct component object ids) MUST be
+         obtainable without walking lineage (e.g. via the bootstrap, §7 BOOT-2).
+RDELTA-1: A State Root that persists the memory plane MUST also commit a runtime
+         delta, UNLESS signed runtime policy proves no non-memory runtime state is
+         required for resume. reset, golden, clean, and filesystem-only persistence
+         need none (§6.6).
+RDELTA-2: The runtime delta is a Terrapin object over runtime-native bytes (§15
+         LLRD1), interpretable ONLY by a runtime satisfying the sandbox pin (§2.5)
+         and the compatibility matrix (§11.4); LLIFS defines no portable structure
+         for it in v1.
+RDELTA-3: The runtime delta MUST be captured under the SAME freeze barrier as the
+         memory and filesystem deltas (DELTA-4, WRITE-1), sharing one freeze epoch.
+RDELTA-4: The runtime delta MUST be directly resolvable on the resume critical path
+         with no lineage traversal (DELTA-5).
+RDELTA-5: Restore MUST apply the base runtime-state blob THEN the runtime delta
+         before unfreeze, and MUST fail closed on a mismatch or on a missing required
+         runtime delta (RDELTA-1).
 
 ⸻
 
 6.2 State Root
 
 A State Root (§2.3) is the content-addressed identity of one persisted agent
-snapshot. It is minted at suspend, hibernate, or fork — never for a merely-running
+snapshot. It is minted at suspend, hibernate, or fork, never for a merely-running
 agent. Its canonical byte encoding and identifier (a Terrapin object) are §15;
 this section fixes the committed fields and their rules.
 
@@ -1112,11 +1297,14 @@ A State Root commits:
                  agent. A fork allocates a NEW actor (§6.3).
   parent         the State Root this derives from, or "none" for genesis; the
                  lineage edge (§6.3).
-  base           the base descriptor reference (§2.5) — the shared base rootfs +
+  base           the base descriptor reference (§2.5): the shared base rootfs +
                  base memory snapshot + runtime-state blob + memory layout this
                  snapshot restores onto.
   memory         the memory delta reference (DELTA-1), or "none".
   filesystem     the filesystem delta reference (DELTA-2), or "none".
+  runtime        the runtime delta reference (DELTA-2R, RDELTA-1), or "none";
+                 required when the memory plane is persisted unless signed policy
+                 proves none is needed (RDELTA-1).
   sandbox pin    the per-architecture sandbox pin (§2.5), required when memory is
                  persisted.
   workload       the workload identity (SR-5), required when any per-agent plane
@@ -1132,24 +1320,38 @@ SR-1: A State Root MUST commit all fields above; absent components MUST be the
       scheme (§2.1).
 SR-2: A State Root MUST reference a base descriptor; restore MUST validate the
       State Root under the runtime regime AND the base descriptor under the builder
-      regime (DIGEST-BIND-4/6) — a trusted State Root does not confer trust on its
+      regime (DIGEST-BIND-4/6); a trusted State Root does not confer trust on its
       base.
-SR-3: memory and filesystem are the per-agent state references; setting NEITHER is
-      valid (a clean or golden-only snapshot, §6.6). A resume reads whichever is
-      non-"none".
+SR-3: memory and filesystem are the per-agent state references (the runtime delta
+      accompanies a persisted memory plane per SR-4/RDELTA-1); setting NEITHER memory
+      nor filesystem is valid (a clean or golden-only snapshot, §6.6). A resume reads
+      whichever references are non-"none".
 SR-4: A State Root that persists ANY per-agent plane (memory or filesystem) MUST
-      commit the workload identity (SR-5) — a delta is workload-specific and
+      commit the workload identity (SR-5); a delta is workload-specific and
       MUST NOT be restored against a different workload. A State Root that persists
       the memory plane MUST additionally commit the sandbox pin (§2.5,
-      DIGEST-BIND-7).
-SR-5: The WORKLOAD IDENTITY is a digest over the restore-relevant booting fields
-      only — per container: name, image, command, env; plus the pause image —
-      taken from the control plane's workload spec; its canonical byte encoding is
-      §15. On restore the supplied workload MUST match the committed workload
-      identity; a mismatch MUST reject, not silently restore.
+      DIGEST-BIND-7) and the runtime delta unless signed policy proves none is
+      required (RDELTA-1).
+SR-5: The WORKLOAD IDENTITY is a canonical Terrapin digest (§15 LLWI1) over the
+      RESTORE-VISIBLE fields of the control plane's workload spec
+      (atelet.WorkloadSpec): every field that, if different at restore, could
+      invalidate or make unsafe the reapplication of a persisted memory/filesystem
+      delta. It MUST commit, at pod scope: the pause image, hostname, the host- and
+      shared-namespace flags, and the pod security context; and per container, in
+      declared order: name, image, command, args, env, working directory, run-as
+      user/group, capabilities (added and dropped), security profile (privileged,
+      read-only-rootfs, no-new-privileges, seccomp/AppArmor/SELinux), mount and
+      volume-device topology (mount path, sub-path, read-only, source name/type),
+      exposed devices, and the restore-relevant resource limits (at least the memory
+      limit, which constrains the guest address space). Fields intentionally EXCLUDED
+      (they do not affect restored state or are regenerated post-restore) are
+      enumerated in §15 LLWI1 (ENC-WI-2). On restore the supplied workload MUST match
+      the committed workload identity exactly; a mismatch MUST reject, never silently
+      restore. Any atelet.WorkloadSpec field that affects restore correctness MUST be
+      added to LLWI1 and to this list, never silently ignored.
 SR-6: created is committed, so it participates in identity: two snapshots of one
-      actor collapse to one State Root identifier ONLY when all committed fields —
-      including created — are byte-identical (intended idempotent-retry behavior,
+      actor collapse to one State Root identifier ONLY when all committed fields,
+      including created, are byte-identical (intended idempotent-retry behavior,
       not a collision). Snapshots that differ only in created are distinct State
       Roots; an implementation wanting retries to collapse across a time boundary
       MUST reuse the original created value.
@@ -1160,17 +1362,17 @@ SR-6: created is committed, so it participates in identity: two snapshots of one
 
 The parent State Root reference forms a hash-linked DAG over State Roots: a State
 Root identifier transitively commits to its ancestry. A FORK creates a new actor that begins from
-an existing snapshot's exact state, then diverges — the differentiator for
+an existing snapshot's exact state, then diverges: the differentiator for
 speculative agent branching.
 
 FORK-1: A fork MUST allocate a NEW actor identity and a new State Root whose parent
         is the source snapshot.
 FORK-2: base (the base descriptor) MUST be shared by reference, never copied.
-FORK-3: The child's memory and filesystem deltas MUST begin as copy-on-write
-        references to the source State Root's delta components; only diverged
-        pages/files MAY be newly stored. No per-plane copy is required at fork
-        time. These references MUST be DIRECT and self-contained: a child delta
-        names the exact base/parent component objects it depends on, so resume
+FORK-3: The child's memory, filesystem, and runtime deltas MUST begin as
+        copy-on-write references to the source State Root's delta components; only
+        diverged pages/files MAY be newly stored. No per-plane copy is required at
+        fork time. These references MUST be DIRECT and self-contained: a child delta
+        names the exact base/ancestor component objects it depends on, so resume
         resolves them by direct reference and never walks the lineage chain
         (LINEAGE-3). A compaction step MAY flatten a chain into direct references,
         but resume MUST NOT depend on traversal.
@@ -1178,6 +1380,13 @@ FORK-4: A fork MUST NOT require rehydrating the source onto the child's node bef
         the child can resume; cold pages/blocks fault on demand (§5.4, §8). A fork
         is a read fan-out of one snapshot to N children and SHOULD reuse the
         fan-out, hedge, and seed machinery of §8/§10.
+FORK-6: Self-containment (DELTA-5) moves cost off the resume path onto snapshot and
+        compaction: producing a self-contained child MAY require O(parent-dirty-pages
+        + parent-upper-metadata) work (a large LLMD1 map naming ancestor pages
+        directly; a complete LLFD1 upper). This is an intentional tradeoff. For
+        high-fan-out speculative branching, a later Merkle-map/trie representation of
+        LLMD1/LLFD1 MAY let forked children structurally share maps while staying
+        directly resolvable; v1 accepts the flat cost.
 FORK-5: A fork's State Root MUST be runtime-attested by the node/control plane
         performing it (§2.5); the verifiable parent link preserves the chain to the
         source. Fork authorization MUST be a control-plane policy decision (who may
@@ -1187,7 +1396,7 @@ LINEAGE-1: parent MUST reference a resolvable, verifiable State Root or be "none
 LINEAGE-2: The substrate MUST be able to enumerate a State Root's lineage for GC
            (§9) and revocation (§14).
 LINEAGE-3: Lineage depth MUST NOT be on the resume critical path: a resume reads
-           the State Root's direct base/memory/filesystem references, not the
+           the State Root's direct base/memory/filesystem/runtime references, not the
            ancestor chain (§7).
 
 ⸻
@@ -1198,18 +1407,22 @@ Agents PRODUCE state; the write path is normative. On suspend, hibernate, or for
 
   1. Freeze the agent (quiesce the runtime).
   2. Checkpoint memory; compute the page-indexed memory delta against the base
-     (and parent, for a fork), writing only changed pages (DELTA-1).
+     (and parent, for a fork), writing only changed pages (DELTA-1). Capture the
+     runtime delta (the diverged non-memory runtime state, DELTA-2R) unless signed
+     policy proves none is required (RDELTA-1).
   3. Capture the writable upper into the filesystem delta (DELTA-2).
   4. Write all new objects to the CAS under temporary names and atomically promote
      each only after Terrapin verification.
-  5. Compute the delta object identifiers; assemble and identify the State Root
+  5. Compute the memory, filesystem, and runtime delta object identifiers; assemble
+     and identify the State Root
      (§15).
   6. Obtain the runtime attestation over the State Root (§2.5).
   7. Publish the State Root to the control plane; demote node-pinned objects toward
      the cold tier per the run mode and tier policy (§6.6, §9).
 
-WRITE-1: Steps 1–3 MUST occur under a single freeze barrier so the memory and
-         filesystem deltas share one freeze epoch (DELTA-4, §5).
+WRITE-1: Steps 1-3 MUST occur under a single freeze barrier so the memory,
+         filesystem, and runtime deltas share one freeze epoch (DELTA-4, RDELTA-3,
+         §5).
 WRITE-2: New objects MUST be written under temporary names and atomically promoted
          only after Terrapin verification.
 WRITE-3: A State Root MUST NOT be published until every object it references is
@@ -1254,9 +1467,9 @@ RESET-1: The default reset is restore-fresh: bind the next request to a freshly
          restored base instance and discard the completed one. The fresh instance
          shares resident base pages copy-on-write (§5.4), so it is cheap (no
          per-agent delta to load), NOT a cold start.
-RESET-2: Reset MUST reset EVERY mutable plane — guest memory, the filesystem
+RESET-2: Reset MUST reset EVERY mutable plane: guest memory, the filesystem
          upper, fd table/offsets, task/thread/timer/signal/futex state, sentry/
-         kernel runtime state, and external resources (RHAZARD) — not merely drop
+         kernel runtime state, and external resources (RHAZARD), not merely drop
          the memory overlay.
 RESET-3: Reset MUST clear RHAZARD-1..7 (§5.6) before the instance serves, or assert
          each not-applicable by signed base policy.
@@ -1282,11 +1495,23 @@ YIELD-1: Yield is hibernate applied to an agent blocked on an upstream call, plu
          an upstream transaction. The proxy MUST take durable ownership of the
          upstream request before the agent is evictable; the pre-ack window MUST
          NOT be evictable and pre-ack eviction attempts MUST be observable.
-YIELD-2: Upstream execution MUST be single-flight under a durable transaction id
+YIELD-2: Upstream SUBMISSION MUST be single-flight under a durable transaction id
          bound to (agent invocation, upstream target, request-body digest, retry
-         epoch), issued before upstream execution begins; at most one upstream call
-         executes across any eviction/restore, and it MUST NOT deduplicate distinct
-         invocations nor permit a duplicate of a non-idempotent call.
+         epoch), issued and durably logged BEFORE submission begins. The proxy MUST
+         NOT, on its own initiative, submit the same transaction id more than once,
+         and the id MUST NOT deduplicate distinct invocations.
+YIELD-2a: Single-flight submission does NOT by itself guarantee at-most-once
+         upstream EXECUTION. The proxy's durable log MUST model each transaction as
+         one of not_sent, sent_unknown (submitted, outcome unconfirmed: crash or
+         ambiguous network failure), response_held (a definitive response captured),
+         or definitive_failure. From sent_unknown the proxy MUST NOT silently
+         resubmit a non-idempotent call. At-most-once EXECUTION across a sent_unknown
+         ambiguity is achievable ONLY with upstream cooperation: an idempotency key
+         the upstream deduplicates on, or a cooperative upstream transaction
+         protocol. Absent that, per-upstream policy MUST choose between failing
+         definitively (no resubmission) and resubmitting (accepting possible
+         duplicate execution); the substrate MUST NOT claim general exactly-once
+         effects for arbitrary non-idempotent upstreams.
 YIELD-3: The agent↔proxy downstream connection is NOT preserved (RHAZARD-3); on
          wake the restored delta resumes its pending read and the proxy delivers
          the single held response (replay for retrying clients; a defined
@@ -1335,11 +1560,13 @@ suspend/stop:
   golden                 start from a shared base memory snapshot (plus base
                          rootfs) with per-agent state discarded on stop; sharing
                          falls out of base copy-on-write (§5). ("golden" here names
-                         this RUN MODE only; it is not an object class — the
+                         this RUN MODE only; it is not an object class: the
                          "golden memory" object term is retired, §17.)
   persist-rootfs         the filesystem delta persists; memory is "none" (warm fs,
                          cold process).
-  persist-rootfs+memory  both deltas persist; the flagship sub-second wake.
+  persist-rootfs+memory  the filesystem, memory, and runtime deltas persist (exact
+                         process resume requires the runtime delta, RDELTA-1); the
+                         flagship sub-second wake.
 
 RUNMODE-1: run_mode is the authoritative selector of which planes a State Root
            persists; a request to discard a plane MUST NOT silently preserve it.
@@ -1357,13 +1584,13 @@ includes substrate overhead that does not. The agent-overlay term:
     reset:     completed → 0 agent overlay (no stored delta; discarded)
     hibernate: paused    → ~0 agent RAM (delta on local/external tier)
     yield:     blocked   → ~0 agent RAM (delta on tier; the proxy holds the
-               in-flight call — relocated, not eliminated)
+               in-flight call: relocated, not eliminated)
 
 Total node-resident RAM also includes the per-sandbox runtime floor (sentry/
 runtime + gofer + netstack buffers), filesystem overlay residency, proxy-held
 request/response buffers, and snapshot/restore working memory. Resident
 concurrency is therefore runtime-floor-bound, while TOTAL hosted agents is bounded
-by ACTIVE concurrency plus delta tier capacity — so for mostly-blocked LLM agents,
+by ACTIVE concurrency plus delta tier capacity, so for mostly-blocked LLM agents,
 reset/hibernate/yield are load-bearing for density, not merely nice to have: they
 free the runtime floor, which base sharing alone cannot.
 
@@ -1390,7 +1617,7 @@ compel (that is §7.2).
 PROFILE-1: A profile MUST NOT weaken verification or alter any identity. It orders
            and predicts; it never authorizes.
 PROFILE-2: A startup profile MUST be selected using the final command, args,
-           working directory, and explicitly whitelisted env keys — never
+           working directory, and explicitly whitelisted env keys, never
            arbitrary user-controlled env, which MUST NOT select an expensive
            mandatory action.
 PROFILE-3: A profile MUST be keyed by the identities it optimizes, plus the
@@ -1408,7 +1635,7 @@ PROFILE-5: A resume profile records the pages/files a wake touches first; for th
 7.2 Runtime requirements (trusted policy)
 
 Runtime requirements are trusted policy derived from signed metadata, admission
-policy, or operator configuration — never from an untrusted profile alone.
+policy, or operator configuration, never from an untrusted profile alone.
 
 POLICY-1: Mandatory prehydration, fail-closed behavior, pod rejection, expected-
           mutable-file handling (§4.5), and mmap/exec-critical coverage MUST come
@@ -1423,7 +1650,7 @@ POLICY-3: Requirements affecting fail-closed behavior MUST be covered by signatu
 
 7.3 Packs (transport envelopes)
 
-A pack — startup pack (cold) or resume pack (warm) — is a transport envelope, not
+A pack, startup pack (cold) or resume pack (warm), is a transport envelope, not
 a mounted object. It carries canonical block payloads that are scatter-extracted
 into the canonical CAS, so pack bytes never form a separate cache identity.
 
@@ -1463,13 +1690,14 @@ BOOT-1: A startup bootstrap MUST carry the metadata needed to reach a mountable,
         startup-required objects, the inlined proof material to verify them, and
         the trust material for the cold path's signature/policy and
         materialization-assurance checks (the signed base descriptor and its
-        assurance record, §3, §14) — or proof these are already locally cached.
+        assurance record, §3, §14), or proof these are already locally cached.
 BOOT-2: A resume bootstrap MUST carry everything needed to validate AND restore
         with no round trip: the State Root object; the runtime attestation envelope
         (§2.5); the referenced base descriptor and its builder-regime validation
         material (signature/attestation, sandbox pin, memory layout) for SR-2 /
-        DIGEST-BIND-6; the memory and filesystem delta references resolved to their
-        DIRECT component objects (§6.3); the restore working set (§5.5) and resume
+        DIGEST-BIND-6; the memory, filesystem, and runtime delta references resolved
+        to their DIRECT component objects (§6.3); the restore working set (§5.5) and
+        resume
         pack BlockRef list; and inlined proofs for all resume-critical blocks. Any
         of these MAY be omitted only if proven already locally cached and verified.
 BOOT-3: P0 startup/resume reads AND their verification MUST NOT require a metadata,
@@ -1477,7 +1705,7 @@ BOOT-3: P0 startup/resume reads AND their verification MUST NOT require a metada
         exec/unfreeze MUST be in the bootstrap or locally cached. (Proof blocks for
         an object below a configurable size SHOULD be inlined or prefetched whole;
         one 2 MiB level-1 block authenticates up to 128 GiB, §2.2.)
-BOOT-4: A bootstrap SHOULD be prewarmed/seeded to candidate nodes — startup
+BOOT-4: A bootstrap SHOULD be prewarmed/seeded to candidate nodes: startup
         bootstraps to seed nodes for a rollout, resume bootstraps to candidate
         resume nodes for PAUSED actors and seed nodes for SUSPENDED actors (§10).
 
@@ -1507,9 +1735,9 @@ components so operators can attribute a slow start.
        + materialization-assurance verify + profile select + startup pack fetch
        + scatter/verify + mount + runtime create + exec
   TTR  = State Root resolve + runtime-attestation verify + base resolve (warm via
-       the base plane) + memory & filesystem delta resolve + verify + resume pack
-       fetch (hot working set) + restore (page-in; runtime restore) + overlay
-       attach + unfreeze + first request
+       the base plane) + memory, filesystem & runtime delta resolve + verify + resume
+       pack fetch (hot working set) + restore (page-in; base runtime-state + runtime
+       delta applied) + overlay attach + unfreeze + first request
 
 TTFE-1: Metrics MUST decompose TTFE and TTR into the components above, so a start
         can be attributed (metadata-, proof-, network-, decompression-,
@@ -1518,7 +1746,9 @@ TTR-1: A resume MUST fault the hot working set first and lazily fault the cold
        tail at P0 (§5.4, §8); full hydration MUST NOT be on the critical path
        unless run mode or policy requires it. If the runtime restore eagerly
        touches the whole memory image, the start MUST be reported as restore-bound,
-       not as a thin lazy resume.
+       not as a thin lazy resume. The runtime delta is resolved directly (RDELTA-4)
+       and applied with the base runtime-state before unfreeze (RDELTA-5); it is part
+       of restore, not lazily faulted.
 
 ⸻
 
@@ -1530,8 +1760,8 @@ DRIFT-2: A profile SHOULD be marked stale when its miss ratio exceeds a configur
          threshold (default 20% over a meaningful window) and SHOULD trigger a
          re-profiling event; a new profile MUST use a new profile identifier and
          MUST NOT mutate the old profile record. (Profiles and runtime
-         requirements are signed metadata records — their trust identity is the
-         signature/digest over their bytes, §14 — not Terrapin object classes.)
+         requirements are signed metadata records: their trust identity is the
+         signature/digest over their bytes, §14, not Terrapin object classes.)
 
 Materialization strictness selects how much must be present before a milestone;
 it is trusted policy and is orthogonal to run mode (§6.6) and tier:
@@ -1553,15 +1783,15 @@ STRICT-2: Strictness mode MUST be visible in status, events, and metrics; runtim
 
 Every byte exposed to a workload is verified against a trusted Terrapin identifier
 (§2). This section is the read path beneath that guarantee: how a block is
-located, deduplicated in flight, prioritized, hedged, and sourced — from local
-cache, peers, mirrors, or origin — without ever trusting transport.
+located, deduplicated in flight, prioritized, hedged, and sourced (from local
+cache, peers, mirrors, or origin) without ever trusting transport.
 
 ⸻
 
 8.1 Read path
 
   cache hit:  read → map (path/offset or guest address) → BlockRef → local CAS
-              hit (already verified) → return bytes.
+              hit (already verified; local integrity per READ-7) → return bytes.
   cache miss: read → BlockRef → join/create singleflight → P0 fetch → source
               select → fetch (compressed or raw) → verify the wire digest if
               present → bounded decompression if needed → load proofs (from
@@ -1569,7 +1799,7 @@ cache, peers, mirrors, or origin — without ever trusting transport.
               BlockRef / Terrapin proof → admit to canonical CAS → return bytes.
               (Uncompressed-identity verification can only occur AFTER
               decompression; compressed bytes are verified beforehand only against
-              a wire digest — COMP-2/COMP-3.)
+              a wire digest, COMP-2/COMP-3.)
 
 READ-1: Foreground reads MUST have strict priority over background hydration.
 READ-2: Bytes MUST NOT be returned until verified against a trusted Terrapin
@@ -1584,6 +1814,17 @@ READ-5: Per-container, per-tenant, and per-node in-flight fetch memory MUST be
 READ-6: A failed source fetch MUST fall back to other allowed sources; a
         verification failure MUST reject the source and retry elsewhere if policy
         allows (§8.6, §14).
+READ-7: A local CAS entry is treated as verified after admission (READ-2), so the
+        node's local store (RAM CAS, page cache, on-disk CAS) is inside the node's
+        trusted computing base for already-admitted blocks. A deployment MUST protect
+        that store against post-admission corruption (disk/bit rot, stale page cache,
+        buggy local mutation) by at least one mechanism: a per-block integrity check
+        on read, fs-verity/dm-verity over the CAS backing, or periodic scrubbing
+        against the Terrapin tree. On detected corruption the entry MUST be treated
+        as ABSENT and re-fetched and re-verified (§8.2), never served. (Cross-host
+        transport is never a trust anchor, TERRAPIN-4; READ-7 is about the LOCAL
+        store after admission.) The mechanism is an operational choice, but one MUST
+        be stated and enabled.
 
 ⸻
 
@@ -1615,7 +1856,7 @@ BLOCK-5: Singleflight state MUST be cache-domain-aware (§9).
   P4  background hydration
   P5  full-image archival / prewarm
 
-QUEUE-1: P0 MUST preempt P2–P5.
+QUEUE-1: P0 MUST preempt P2-P5.
 QUEUE-2: P1 SHOULD be generated only from strong evidence.
 QUEUE-3: P4/P5 MUST be rate-limited during cluster-wide rollout.
 QUEUE-4: Fetch admission SHOULD consider NIC pressure, disk-queue depth, registry
@@ -1635,7 +1876,7 @@ HEDGE-2: The first VERIFIED response wins; losing hedges SHOULD be cancelled
          immediately.
 HEDGE-3: A corrupt response MUST penalize or eject the source; a slow response
          MUST lower its score but MUST NOT be treated as corrupt.
-HEDGE-4: P2–P5 background hydration SHOULD NOT hedge by default.
+HEDGE-4: P2-P5 background hydration SHOULD NOT hedge by default.
 HEDGE-5: Hedging MUST respect tenant, registry-auth, egress, and cache-domain
          policy.
 ORIGIN-1: P0 origin hedging MUST be protected by per-registry and per-image circuit
@@ -1743,7 +1984,7 @@ FAIL-4: Failures that would classically appear as ImagePull errors MUST be repor
 
 The fetch tiers and source order are §8.5. This section governs WHO may share a
 cached block (cache domains and keying), how shared objects are kept alive
-(leases and liveness), and how they are reclaimed (GC) — at agent-FaaS scale,
+(leases and liveness), and how they are reclaimed (GC), at agent-FaaS scale,
 where one base object is referenced by a million agents.
 
 ⸻
@@ -1776,12 +2017,12 @@ KEY-2: The per-domain secret MUST be node-local and MUST NOT be sent to peers or
        registries (PEER-3).
 KEY-3: Keys are VERSIONED by epoch. Rotation bumps the epoch and writes new entries
        under the new key; rotation MUST NOT delete or rewrite existing entries
-       (avoiding a mass invalidation storm) — old-epoch entries become
+       (avoiding a mass invalidation storm); old-epoch entries become
        unreferenced and are reclaimed by GC.
 KEY-4: A bounded grace window MAY keep the prior epoch readable. A prior-epoch
        entry is GC-eligible ONLY when it has no live lease (LEASE-3); an old-epoch
        entry that still has a live lease MUST remain readable, or be lazily
-       re-written under the current epoch, before the grace window expires — so
+       re-written under the current epoch, before the grace window expires, so
        rotation never strands live-leased content (rotation MUST NOT reduce
        reachability of any leased object).
 KEY-5: Proof-block caches obey the same domain keying as data blocks. Shared proof
@@ -1809,7 +2050,7 @@ LEASE-2: Lease updates MUST be atomic and crash-safe: a crash MUST NOT
          journal or by rescanning the live lease set, so neither leaked nor dropped
          pins survive recovery.
 LEASE-3: An object with a live lease in a domain MUST NOT be evicted from that
-         domain; liveness aggregates across ALL referencing images/agents —
+         domain; liveness aggregates across ALL referencing images/agents;
          eviction is a domain-level decision, not per-image.
 LEASE-4: Hibernation deltas are leased objects: a hibernated agent holds a lease on
          its delta, and the base it will wake to MUST be kept live by a lease that
@@ -1826,7 +2067,7 @@ GC-2: GC MUST respect cache-domain boundaries; an object's eligibility is evalua
       per domain by that domain's liveness and epoch.
 GC-3: Eviction order SHOULD prefer unreferenced, low-fan-in, cold objects, and
       preferentially retain high-fan-in objects (shared by many images/agents) and
-      startup/mmap-critical/proof/base blocks — evicting a high-fan-in object harms
+      startup/mmap-critical/proof/base blocks; evicting a high-fan-in object harms
       many workloads at once.
 GC-4: Stale-epoch entries (post-rotation, past the grace window) with no live lease
       are first-class GC candidates.
@@ -1835,22 +2076,23 @@ GC-5: GC SHOULD export eviction reasons (§13).
 Fleet-scale GC (a shared base object may have ~a million referrers, so a hot
 per-agent refcount on it is impractical). GC is ONE model: a mark-sweep whose ROOTS
 are the live leases (§9.2) and the live State Roots; an object survives iff it is
-reachable from a root. Leases and State Roots are roots/pins for that sweep — this
+reachable from a root. Leases and State Roots are roots/pins for that sweep; this
 reconciles LEASE-3 (a leased object is never evicted) with GC-FLEET (no hot
 per-operation refcount): "not per-operation refcount" means the base is not
 incremented/decremented per agent, NOT that leases are ignored.
 
 GC-FLEET-1: Shared base objects (base rootfs content objects + the base memory
-            snapshot — including the snapshot used by the golden run mode) MUST be
+            snapshot, including the snapshot used by the golden run mode) MUST be
             pinned by a template/operator lease while the template is live and MUST
             NOT be GC'd by per-agent churn; this avoids a hot per-agent refcount on
             the base.
-GC-FLEET-2: Per-agent objects (memory and filesystem delta components) are retained
+GC-FLEET-2: Per-agent objects (memory, filesystem, and runtime delta components) are
+            retained
             iff REACHABLE from a live actor's retained State Root or a live lease,
-            plus lineage retention/squash (§6.3) — not by a per-object refcount.
+            plus lineage retention/squash (§6.3), not by a per-object refcount.
 GC-FLEET-3: The mark-sweep from each live State Root MUST traverse its base
             descriptor reference, so a base stays live while ANY retained State Root
-            (active or hibernated) can resume from it — even if the template/
+            (active or hibernated) can resume from it, even if the template/
             operator lease has been removed (resolving LEASE-4 vs GC-FLEET-1). The
             sweep MUST NOT use per-operation refcounting and MUST respect
             cache-domain boundaries (GC-2).
@@ -1897,10 +2139,10 @@ faults few bytes. Warmth is computed over canonical BlockRefs and content object
 10.1 Warmth model
 
 WARM-1: Warmth MUST be computed over canonical BlockRefs (block presence) and, for
-        cross-image/cross-agent sharing, over content objects and base objects —
+        cross-image/cross-agent sharing, over content objects and base objects,
         never over packs (COVERAGE-1/2).
-WARM-2: A node MUST be able to advertise BASE warmth — the set of held content
-        objects and base memory snapshot blocks — scoped to a cache domain and
+WARM-2: A node MUST be able to advertise BASE warmth (the set of held content
+        objects and base memory snapshot blocks) scoped to a cache domain and
         INDEPENDENT of any specific image or agent. At agent-FaaS scale base
         warmth is the dominant placement signal: a node warm on a template's base
         can run almost any of that template's agents.
@@ -1945,7 +2187,7 @@ AFFINITY-2: For a SUSPENDED actor (external tier) the scheduler SHOULD prefer an
             small and faults lazily (§7.6).
 AFFINITY-3: Resume affinity MUST be advisory: a State Root MUST be resumable on any
             node that can validate it and satisfy the sandbox pin (§2.5), so loss
-            of a warm node never strands an actor — it only costs latency.
+            of a warm node never strands an actor; it only costs latency.
 
 ⸻
 
@@ -1967,9 +2209,9 @@ ROLLOUT-3: Background prewarm/hydration MUST be interruptible and rate-limited
 
 WARM-6: Warmth state exposed for scheduling (per node: startup/proof/mmap/
         readiness/base coverage ratios, last-verified time) MUST be keyed by the
-        identities it describes — the PROFILE-3 cold key (logicalRootfsDigest,
+        identities it describes: the PROFILE-3 cold key (logicalRootfsDigest,
         layoutDigest, selector, profile id) for images; the base descriptor digest
-        for bases — within a cache domain, and is carried by the control-plane
+        for bases, within a cache domain, and is carried by the control-plane
         integration (§12), not by a workload-visible surface (REDACT-1).
 
 ⸻
@@ -2010,7 +2252,7 @@ GVISOR-2: Lazy/on-demand restore SHOULD be REUSED, not rebuilt: the existing
           the same CAS-backed gofer, where bytes are verified as served. The gofer
           serves the runtime's expected page view by mapping the runtime's
           pages-file offsets to LLIFS BlockRefs through the committed memory layout
-          (§5.3) — the base memory snapshot identity is unchanged; the pages file
+          (§5.3): the base memory snapshot identity is unchanged; the pages file
           is a view, not a new object. (If the runtime's native pages-file layout
           is not already guest-address-linear, the memory layout provides the
           deterministic mapping.) Lazy, remote-sourced, and verified restore
@@ -2025,11 +2267,27 @@ GVISOR-3: The ONE net-new capability is SHARED COPY-ON-WRITE BASE restore: backi
           Without this, every restore materializes its own multi-GiB guest memory
           and the density thesis fails; with it, a million agents share one base.
           This is the substrate's sole hard runtime dependency and its central
-          density mechanism. (Justification: §6.7. It is a minimal, surgical change
-          — it changes where base pages are backed, not the checkpoint format.)
+          density mechanism. (Justification: §6.7. It is a minimal, surgical change:
+          it changes where base pages are backed, not the checkpoint format.)
 GVISOR-4: The runtime-state blob (§5.1) MUST be compatible with the runtime's
           platform mode; the mode MUST be recorded in the base descriptor and the
           compatibility matrix (§11.4).
+GVISOR-5: gVisor directfs (sandbox-direct host-fd filesystem access that bypasses the
+          gofer round trip) MUST be DISABLED for the LLIFS lower in v1: the gofer is
+          the verify-before-expose and cache-domain enforcement choke point
+          (GVISOR-1, §9), and directfs would let the sandbox read lower bytes the
+          gofer never verified. directfs MAY be enabled for the LLIFS lower only once
+          the native path preserves the identical verify-before-expose
+          (DIGEST-BIND-6) and cache-domain (§9) semantics (a §11.5 / Phase 4
+          evaluation), and MUST NOT be enabled merely for performance.
+GVISOR-6: The byte paths are distinct abstractions even where they share code: rootfs
+          path/offset reads use the CAS-backed lisafs gofer (GVISOR-1); restore page
+          reads use a CAS-backed PAGE PROVIDER (the pages-file view of GVISOR-2);
+          shared base residency is the MemoryFile/shared-backing change (GVISOR-3). A
+          userfaultfd MISSING fault MUST populate the shared verified base backing,
+          not a per-sandbox private copy (COW-6a); once a base range is resident,
+          additional sandboxes MUST resolve it by shared/minor-fault continuation,
+          never by repeating a private copy.
 
 ⸻
 
@@ -2062,6 +2320,16 @@ MATRIX-1: The matrix MUST record: runtime and runtime version; platform mode;
 MATRIX-2: A mismatch on any required field MUST fail closed with a distinct event
           (§13), never a silent or best-effort restore. The sandbox pin (§2.5) and
           the matrix together gate placement (§10 AFFINITY-3).
+MATRIX-3: Compatibility is decided by a named verifier step, MATCH-COMPAT(committed,
+          restorer), where the COMMITTED value records what the producer captured and
+          the RESTORER value is the candidate node's capability: runtime_id and arch
+          MUST be equal; platform_mode and page_size MUST be equal; runtime_version
+          and checkpoint/state-format version MUST satisfy the runtime's declared
+          backward-compat rule (default: equal); the CPU feature mask MUST be a
+          superset (the restorer provides every committed feature); and the seccomp/
+          cgroup/namespace and ABI assumptions MUST be satisfiable. MATCH-COMPAT MUST
+          run before any base or runtime-delta byte is applied (RDELTA-2/5); any
+          unsatisfied field fails closed (MATRIX-2).
 
 ⸻
 
@@ -2076,7 +2344,7 @@ NATIVE-1: A native backend (e.g. EROFS/fscache, composefs-style verified trees,
 NATIVE-2: A native backend MUST either verify with Terrapin directly or bind its
           native verification root (e.g. an fs-verity root) into signed LLIFS
           metadata, so Terrapin secures network/remote identity while the native
-          mechanism secures local page-cache/disk reads — without double-paying
+          mechanism secures local page-cache/disk reads, without double-paying
           verification on the critical path.
 NATIVE-3: Any native backend MUST preserve cache-domain policy (§9).
 
@@ -2088,7 +2356,8 @@ LLIFS is a substrate; the agent control plane is its consumer adapter, exactly a
 containerd/Kubernetes is a consumer adapter for the filesystem plane. This section
 binds LLIFS to the control plane's existing data model (the ateapi/atelet/ateom
 protos) rather than introducing a parallel one. Proto additions below are PROPOSED
-(not the current schema) and are required deliverables (§16).
+(not the current schema) and are required deliverables, landing in Phase 2 with
+hibernate/resume (§16).
 
 ⸻
 
@@ -2122,7 +2391,7 @@ Today ateapi.SnapshotInfo carries a URI prefix to an opaque snapshot
 (ExternalSnapshotInfo.snapshot_uri_prefix; LocalSnapshotInfo.snapshot_prefix),
 with only external=2 and local=3 in the oneof. The locked decision is a
 backward-compatible oneof extension to a content-addressed, lineage-bearing State
-Root — not a forklift:
+Root, not a forklift:
 
   // PROPOSED addition to ateapi.proto (state_root = 4 is new):
   message SnapshotInfo {
@@ -2135,7 +2404,7 @@ Root — not a forklift:
   }
   message SnapshotPlacement {
     // warm-node list only; same semantics as
-    // LocalSnapshotInfo.node_vms_with_local_snapshots — single source of truth.
+    // LocalSnapshotInfo.node_vms_with_local_snapshots (single source of truth).
     repeated string node_vms_with_local_snapshots = 1;
   }
   message StateRootSnapshotInfo {
@@ -2147,7 +2416,8 @@ Root — not a forklift:
 CP-1: A State Root snapshot MUST be referenced through StateRootSnapshotInfo
       carrying the State Root identifier; legacy external/local remain valid for
       opaque snapshots during migration. The proto additions are a REQUIRED
-      Phase-1 deliverable (§16); LLIFS cannot publish/resume a State Root through
+      Phase 2 deliverable (§16), landing with hibernate/resume; LLIFS cannot
+      publish/resume a State Root through
       Actor.latest_snapshot_info without them.
 CP-2: Tier (local/external) MUST be resolved from which CAS/tier holds the State
       Root's objects (§6.6 TIER-1), consistent with SnapshotType/CheckpointType;
@@ -2179,7 +2449,8 @@ template. A create-from-snapshot needs a source-snapshot field:
 CP-6: When from_state_root is set, CreateActor MUST allocate a NEW actor and the
       child's genesis State Root MUST set parent = from_state_root (§6.3 FORK-1).
       The source State Root is authoritative for base, memory delta, filesystem
-      delta, sandbox pin, and workload identity; template fields, if supplied, MUST
+      delta, runtime delta, sandbox pin, and workload identity; template fields, if
+      supplied, MUST
       be omitted or match and MUST NOT override inherited state; worker_selector
       applies only as a child placement override.
 
@@ -2195,13 +2466,13 @@ cannot drive the §6 write / §7 resume path directly. Two conforming options:
 
 CP-7: Either (a) extend these RPCs with State-Root- and delta-capable request/
       response fields, or (b) front them with a node-local adapter in imagefsd
-      that, on Checkpoint, ingests the runtime's produced checkpoint into the
-      memory/filesystem deltas and emits a State Root (§6.4), and on Restore
-      resolves a State Root into the page view and runtime-state the RPC expects
-      (§11.2). Until the RPCs carry State Roots, the adapter (b) MUST be provided;
+      that, on Checkpoint, ingests the runtime's produced checkpoint into the memory,
+      filesystem, and runtime deltas and emits a State Root (§6.4, DELTA-2R), and on
+      Restore resolves a State Root into the page view, the base runtime-state, and
+      the runtime delta the RPC expects (§11.2, RDELTA-5). Until the RPCs carry State Roots, the adapter (b) MUST be provided;
       neither path may weaken verification (§8) or the freeze-epoch guarantee
-      (§6.4 WRITE-1). These RPC/proto extensions are a REQUIRED Phase-1 deliverable
-      (§16).
+      (§6.4 WRITE-1). These RPC/proto extensions are a REQUIRED Phase 2 deliverable
+      (§16), landing with hibernate/resume.
 
 ⸻
 
@@ -2349,7 +2620,7 @@ local cache entries; compressed bytes before verification.
 
 14.2 Requirements
 
-SEC-1: Every byte exposed to a workload — filesystem, memory, or proof — MUST be
+SEC-1: Every byte exposed to a workload (filesystem, memory, or proof) MUST be
        verified against a trusted Terrapin identifier (§2.2 TERRAPIN-4, §5
        MVERIFY-1). Peers, mirrors, registries, caches, packs, and decompressed
        bytes are transport, never trust anchors (§8).
@@ -2397,7 +2668,7 @@ REV-3: If a base descriptor (or its committed OCI image digest, §2.5
        Revocation evaluation MUST include both lineage enumeration (§6.3
        LINEAGE-2) and State Root `base`-reference resolution: revoking a base MUST
        deny every retained State Root whose `base` reference (§6.2) resolves to
-       that base descriptor — and thus its OCI image digest. (State Roots do not themselves carry
+       that base descriptor, and thus its OCI image digest. (State Roots do not themselves carry
        an OCI subject; the chain is State Root.base → base descriptor → OCI digest.)
 REV-4: Policy MUST define whether already-running agents bound to a revoked base
        are allowed to continue, drained, killed, or isolated.
@@ -2419,7 +2690,7 @@ SCOPE-2: High-availability/multi-replica of the control plane, and full
          control-plane sharding, are out of scope here; the cache-domain keying and
          content-addressed identity (§9) and the byte-exact encodings (§15) are
          fixed so they can be added without changing identity.
-SCOPE-3: At-rest encryption of private memory/filesystem deltas (§6) SHOULD be
+SCOPE-3: At-rest encryption of private memory/filesystem/runtime deltas (§6) SHOULD be
          applied in the cold/blob tier for confidential deployments; encryption
          disables cross-tenant dedup of those objects (which §9 already forbids by
          default), so it composes with the per-domain keying without weakening it.
@@ -2430,7 +2701,7 @@ SCOPE-3: At-rest encryption of private memory/filesystem deltas (§6) SHOULD be
 
 Every identity in LLIFS is a Terrapin digest over a byte-exact canonical encoding,
 so independent implementations agree or reject (the supply-chain equivalence claim,
-MAT-20). This section is the registry of those encodings — pointing to the two
+MAT-20). This section is the registry of those encodings, pointing to the two
 already defined inline, defining the remaining (agent-state) ones, and pinning the
 conformance vectors that make them testable.
 
@@ -2456,6 +2727,7 @@ parser MUST reject trailing bytes.
   memory layout               LLML1  §15.5  → memory layout identifier
   memory delta (page-indexed) LLMD1  §15.6  → memory delta identifier
   filesystem (overlay) delta  LLFD1  §15.7  → filesystem delta identifier
+  runtime delta (opaque)      LLRD1  §15.4  → runtime delta identifier
   workload identity           LLWI1  §15.8  → workload_identity
   sandbox pin                 LLSP1  §15.9  → sandbox pin (external sha256)
 
@@ -2501,13 +2773,14 @@ the bare tree root presented as the identifier.
 
 15.4 State Root encoding (LLSR1)
 
-  magic "LSR1"; version u16=1; then fields in fixed order — varbytes fields are
+  magic "LSR1"; version u16=1; then fields in fixed order; varbytes fields are
   length-framed (so "none" is an explicit length-0 value and optional digests are
   length 0 or 32, never a mix), and the createdSec/createdNsec fields use their
   stated fixed widths:
     actor (varbytes); parent (0 or 32 = State Root id); base (32 = base descriptor
     id); memory (0 or 32 = memory delta id); filesystem (0 or 32 = filesystem delta
-    id); sandbox_pin (0 or 32 = sha256); workload (0 or 32 = workload_identity);
+    id); runtime (0 or 32 = runtime delta id); sandbox_pin (0 or 32 = sha256);
+    workload (0 or 32 = workload_identity);
     run_mode (varbytes of one byte: 1=clean 2=golden 3=persist-rootfs
     4=persist-rootfs+memory); producer (varbytes); createdSec (8-byte i64);
     createdNsec (4-byte u32, 0 <= nsec < 1e9).
@@ -2519,15 +2792,33 @@ ENC-SR-1: All fields MUST be present in this order; "none" is the explicit lengt
           reject. createdNsec >= 1e9 MUST reject.
 ENC-SR-2: Exactly the §6.2/SR-4 conditional rules apply: if memory or filesystem
           is non-none, workload MUST be non-none; if memory is non-none, sandbox_pin
-          MUST be non-none.
+          MUST be non-none. When memory is non-none, runtime is normally non-none
+          and is "none" only under the RDELTA-1 no-runtime-state policy exception;
+          restore enforces RDELTA-5.
+
+Runtime delta encoding (LLRD1), the State Root's runtime field (§6.1 DELTA-2R):
+
+  magic "LRD1"; version u16=1; payload (varbytes, opaque runtime-native bytes
+  captured at freeze). Runtime delta identifier = Terrapin identifier of these bytes.
+
+ENC-RD-1: payload is OPAQUE to LLIFS (no internal structure, like the base
+          runtime_state blob, §15.5 ENC-BD-3); its Terrapin identifier covers the
+          exact stored bytes; trailing bytes MUST reject. A later version MAY define
+          a structured delta against the base runtime_state blob.
+ENC-RD-2: A restorer MUST interpret a runtime delta ONLY under a runtime satisfying
+          the State Root's sandbox pin (§2.5) and the base descriptor's compatibility
+          matrix (§11.4), and MUST apply it only after the base runtime-state blob
+          (RDELTA-5); an incompatible or missing-required runtime delta MUST fail
+          closed (RDELTA-1/5).
 
 ⸻
 
 15.5 Base descriptor encoding (LLBD1)
 
-  magic "LBD1"; version u16=1; then fields in this exact order — varbytes fields
+  magic "LBD1"; version u16=1; then fields in this exact order; varbytes fields
   length-framed, fixed-width fields (32-byte digests, u8, u32) at the stated width:
-    oci_image_digest (varbytes, external sha256); logical_rootfs (32); layout (32);
+    oci_image_digest (varbytes: the ASCII string "sha256:<64 lowercase hex>",
+    ENC-BD-4); logical_rootfs (32); layout (32);
     base_memory (32); runtime_state (32); memory_layout (32); sandbox_pin (32
     sha256); compat_matrix (the CompatMatrix sub-record below); assurance_mode
     (u8: 1=asserted 2=derived-attested 3=node-derived).
@@ -2557,8 +2848,14 @@ ENC-BD-3: runtime_state is a runtime-native OPAQUE byte blob: LLIFS defines no
           internal structure for it, and its Terrapin identifier covers its exact
           stored bytes verbatim. (It is runtime-version-specific; compatibility is
           gated by the compatibility matrix, §11.4.)
+ENC-BD-4: oci_image_digest MUST be the canonical OCI digest STRING form, the exact
+          ASCII bytes "sha256:" followed by exactly 64 lowercase hex characters, and
+          nothing else (it is the external-plane identity, §2.1; raw 32-byte form,
+          uppercase hex, other algorithms, or a missing prefix MUST reject). It is
+          the only base-descriptor field in the external plane; all other digest
+          fields are raw 32-byte Terrapin identifiers.
 
-Memory layout encoding (LLML1) — the base descriptor's memory_layout field (§5.3):
+Memory layout encoding (LLML1), the base descriptor's memory_layout field (§5.3):
 
   magic "LML1"; version u16=1; page_size u32; regionCount u64; regions (sorted by
   guestStart, non-overlapping), each: guestStart u64; length u64; state u8
@@ -2569,11 +2866,21 @@ Memory layout encoding (LLML1) — the base descriptor's memory_layout field (§
   Memory layout identifier = Terrapin identifier of these bytes.
 
 ENC-ML-1: regions MUST be sorted by guestStart, non-overlapping, and tile the
-          committed guest address space exactly; unknown state/prot/flags bits MUST
+          committed guest address space [0, committedEnd) exactly (committedEnd =
+          guestStart+length of the last region); unknown state/prot/flags bits MUST
           reject; trailing bytes MUST reject. This is the byte-exact form of the
           §5.3 MLAYOUT-1..5 mapping (linear order, three-state mapping, page size,
           protections); it commits the per-range mapping state and attributes that
           restore reproduces.
+ENC-ML-2: The base memory snapshot is guest-address-linear (MLAYOUT-1): for a
+          mapped-data region (state 1) objectOffset MUST equal guestStart; for
+          mapped-zero (2) and unmapped/no-access (3) objectOffset MUST be 0 and the
+          region occupies no stored bytes, contributing canonical zeros to the
+          base-memory identity (MEM-1). The base memory snapshot object's manifest
+          length MUST equal committedEnd. Because the MEM-1 identity does not
+          distinguish states 2 and 3 (both zeros), this signed layout is the sole
+          authority for that distinction (MEM-5); any other objectOffset MUST
+          reject.
 
 ⸻
 
@@ -2585,9 +2892,9 @@ ancestor traversal (§6.3 LINEAGE-3) and a fork shares parent/base pages by dire
 reference with no copy.
 
   magic "LMD1"; version u16=1; page_size u32; base_ref (32, the base memory
-  snapshot object); entryCount u64; entries — each:
+  snapshot object); entryCount u64; entries, each:
     guestPageIndex u64;
-    source u8 (1=this-delta-data 2=parent-delta-data 3=base 4=canonical-zero);
+    source u8 (1=this-delta-data 2=ancestor-delta-data 3=base 4=canonical-zero);
     sourceObjectId 32 (the data object for source 1/2; all-zero for source 3/4);
     offset u64; length u64
   sorted ascending by guestPageIndex, unique. The delta's own changed pages live in
@@ -2598,14 +2905,19 @@ ENC-MD-1: The encoding MUST be canonical (one form per restored memory state).
           entries MUST be sorted and unique by guestPageIndex. A page identical to
           the base MUST be OMITTED (it resolves from the base copy-on-write, §5.4);
           source==3 (base) is used ONLY by a fork to explicitly revert a page the
-          parent had changed back to the base value — never to redundantly list a
-          base-identical page. For a fork, unchanged-from-parent pages use source==2
-          naming the PARENT's delta-data object directly (zero-copy, no traversal);
-          changed pages use source==1. Unknown source MUST reject; trailing bytes
-          MUST reject.
+          parent had changed back to the base value, never to redundantly list a
+          base-identical page. For a fork, unchanged-from-ancestor pages use
+          source==2 naming, by absolute Terrapin id, the ANCESTOR delta-data object
+          that actually holds the bytes (resolved ONCE at fork time by reading the
+          parent's map, the §6.3 FORK-3 flatten), so the child map is self-contained
+          and resume never consults any ancestor map; changed pages use source==1.
+          Unknown source MUST reject; trailing bytes MUST reject.
 ENC-MD-2: Each entry covers exactly one guest page: length MUST equal page_size.
           For source==1/2, [offset, offset+length) MUST be in-bounds of the named
-          data object. For source==3 (base), sourceObjectId MUST be all-zero and
+          data object; source==2's sourceObjectId MUST be the absolute Terrapin id of
+          the ancestor delta-data object holding the bytes, which resume reads
+          directly and MUST NOT resolve through any ancestor's page map (LINEAGE-3).
+          For source==3 (base), sourceObjectId MUST be all-zero and
           offset MUST be the page's guest offset within the base memory snapshot.
           For source==4 (canonical zero), sourceObjectId MUST be all-zero and
           offset MUST be 0. On restore each page is resolved from its named source
@@ -2617,21 +2929,43 @@ ENC-MD-3: The delta's own changed pages MUST form exactly ONE canonical
           ascending guestPageIndex order. For each source==1 entry, sourceObjectId
           MUST equal that one object's Terrapin id, length MUST equal page_size, and
           offset MUST equal (the page's ordinal among source==1 entries) * page_size.
-          This makes LLMD1 canonical — the same changed-page state over the same
+          This makes LLMD1 canonical: the same changed-page state over the same
           base/parent yields one memory delta identifier.
+ENC-MD-4: A memory delta MUST be directly resolvable (DELTA-5): every entry names,
+          by absolute Terrapin id, the exact object holding its bytes (this-delta-
+          data, an ancestor delta-data object, or the base via base_ref), and resume
+          reads those named objects directly, never walking lineage or consulting any
+          parent delta's map. base_ref and the source==2 ancestor object id are
+          DIRECT resolution inputs; only the parent State Root link and lineage chain
+          (§6.3) are provenance, GC, and compaction inputs.
+ENC-MD-5: Source selection MUST be canonical (one encoding per effective page state),
+          in this precedence: (a) OMIT a page byte-identical to the base (it resolves
+          from base copy-on-write, §5.4); (b) use source==3 (base) ONLY to revert a
+          fork page the parent had changed back to the base value, never for an
+          already-base-identical page (omitted per (a)); (c) use source==4 (canonical
+          zero) ONLY when the page is all-zero AND the base page at that offset is not
+          all-zero (an all-zero page equal to the base is omitted per (a)); (d)
+          otherwise use source==1 for a changed page and source==2 for a page carried
+          unchanged from an ancestor. A verifier MUST reject structurally detectable
+          violations (ENC-MD-2) and, where it has the base, a redundant source==3/4
+          for a base-identical page.
 
 ⸻
 
 15.7 Filesystem (overlay) delta encoding (LLFD1)
 
 The canonical overlay-delta object reconstructing the writable upper, §6.1. It is
-a FINAL-STATE delta — the resulting upper relative to the parent/base, not a replay
-log — so there are no multi-step operations (a rename is encoded as its result: a
-put at the new path and a whiteout at the old). Op tails reuse the LLT1 common
-prefix exactly.
+a FINAL-STATE delta: it encodes the resulting writable upper directly, not a replay
+log, so there are no multi-step operations (a rename is encoded as its result: a
+put at the new path and a whiteout at the old). It is SELF-CONTAINED against the
+base lower: a resume reconstructs the upper from this object alone, plus the content
+objects it names by absolute id and the base rootfs the State Root references, never
+by walking parent deltas (DELTA-5, LINEAGE-3). Op tails reuse the LLT1 common prefix
+exactly.
 
-  magic "LFD1"; version u16=1; parent_ref (varbytes: 32-byte filesystem delta id,
-  or length-0 = none); opCount u64; ops (sorted by normalized path bytes), each an
+  magic "LFD1"; version u16=1; parent_ref (varbytes: 32-byte filesystem delta id, or
+  length-0 = none; PROVENANCE/GC/compaction only, never required to reconstruct the
+  upper, DELTA-5); opCount u64; ops (sorted by normalized path bytes), each an
   OpRecord:
     path (varbytes, normalized per §3.2);
     op u8 (1=put-file 2=put-dir 3=put-symlink 4=put-chardev 5=put-blockdev
@@ -2639,7 +2973,7 @@ prefix exactly.
     then the op tail:
       put-* common prefix (exactly LLT1 §3.2 widths, in order): mode u32; uid u32;
         gid u32; mtimeSec i64; mtimeNsec u32; xattrCount u32; xattrs (XattrRecords
-        sorted by key, unique — §3.2);
+        sorted by key, unique; §3.2);
       then the type tail: put-file → contentId 32 + contentLen u64; put-symlink →
         target varbytes; put-chardev/put-blockdev → major u32 + minor u32;
         put-dir/put-fifo → (none);
@@ -2656,6 +2990,13 @@ ENC-FD-1: ops MUST be sorted by normalized path and paths MUST be unique (exactl
 ENC-FD-2: whiteouts MUST be representable so deletions survive restore. The
           filesystem delta identifier is the Terrapin identifier of these bytes;
           content objects are separate.
+ENC-FD-3: The filesystem delta MUST be directly resolvable (DELTA-5): it encodes the
+          COMPLETE final-state writable upper and every content reference is an
+          absolute content-object id, so resume reconstructs the upper from this
+          object, its content objects, and the base lower alone. parent_ref is the
+          lineage edge for provenance/GC/compaction and MUST NOT be consulted on the
+          resume critical path; a compaction MAY rewrite a parent-relative storage
+          form into this complete form, but resume MUST NOT depend on traversal.
 
 ⸻
 
@@ -2664,18 +3005,58 @@ ENC-FD-2: whiteouts MUST be representable so deletions survive restore. The
 The §6.2 SR-5 canonical workload identity (an internal Terrapin identity, not an
 external digest).
 
-  magic "LWI1"; version u16=1; pause_image (varbytes); containerCount u64;
-  containers (in declared order) — each: name (varbytes); image (varbytes);
-  cmdCount u64 + each arg (varbytes, in declared order); envCount u64 + each entry
-  (name varbytes; value varbytes), entries SORTED by name bytes then value bytes.
+  magic "LWI1"; version u16=2; then a pod block, then containers.
+
+  Pod block: pause_image (varbytes); hostname (varbytes); host_flags u8 (bit0
+    hostNetwork, bit1 hostPID, bit2 hostIPC, bit3 shareProcessNamespace); pod
+    security (SecurityContext sub-record below).
+
+  containerCount u64; containers (in declared order), each:
+    name (varbytes); image (varbytes);
+    cmdCount u64 + each (varbytes, declared order);
+    argsCount u64 + each (varbytes, declared order);
+    envCount u64 + each (name varbytes; value varbytes), SORTED by name then value;
+    working_dir (varbytes);
+    security (SecurityContext sub-record);
+    capAddCount u64 + caps (varbytes, SORTED, unique);
+    capDropCount u64 + caps (varbytes, SORTED, unique);
+    mountCount u64 + mounts (SORTED by mountPath), each: mountPath (varbytes);
+      subPath (varbytes); sourceName (varbytes); sourceType (varbytes); mflags u8
+      (bit0 readOnly);
+    deviceCount u64 + devices (SORTED by path), each: path (varbytes);
+    mem_limit u64 (bytes, 0 = unset); cpu_limit_milli u64 (0 = unset).
+
+  SecurityContext sub-record: runAsUser i64 (-1 = unset); runAsGroup i64
+    (-1 = unset); sflags u8 (bit0 privileged, bit1 readOnlyRootFilesystem, bit2
+    allowPrivilegeEscalation, bit3 runAsNonRoot); seccomp (varbytes); apparmor
+    (varbytes); selinux (varbytes).
+
   workload_identity = Terrapin identifier of these bytes.
 
-ENC-WI-1: Fields are taken from atelet.WorkloadSpec (which carries them); ateom's
-          reduced Container is insufficient (§12). List fields are ALWAYS present
-          with their count; absent and empty lists are intentionally identical
-          (count 0). Duplicate env names MUST reject. The encoding MUST be
-          deterministic. (This is the value of the State Root `workload` field,
-          §6.2; "workload_spec_digest" is a deprecated alias for workload_identity.)
+ENC-WI-1: Fields are the restore-visible projection of atelet.WorkloadSpec (which
+          carries them); ateom's reduced Container is insufficient (§12). Every list
+          is ALWAYS present with its count; absent and empty lists are identical
+          (count 0). env, capAdd, capDrop, mounts, and devices MUST be sorted as
+          stated and unique by their sort key (a duplicate env name, capability,
+          mount path, or device path MUST reject). Unset scalars use their stated
+          sentinel (i64 -1, u64 0, varbytes length 0). The encoding MUST be
+          deterministic. (This is the value of the State Root `workload` field, §6.2;
+          "workload_spec_digest" is a deprecated alias for workload_identity.) The
+          exact field set MUST be reconciled against atelet.WorkloadSpec before §15
+          is frozen. This is a HARD freeze blocker, not a nicety: a workload-identity
+          mismatch is a restore-safety bug, so any WorkloadSpec field that affects
+          restore correctness MUST be added here (SR-5) before v1.0 freezes.
+ENC-WI-2: Fields intentionally EXCLUDED, because they do not affect restored state or
+          are regenerated post-restore, MUST NOT be committed: scheduling and
+          placement (node name, affinity, tolerations, priority, topology); status
+          and conditions; liveness/readiness/startup probes; restart policy; image
+          pull policy and pull secrets (provenance, not restore state);
+          purely-informational labels and annotations; dynamically assigned values
+          (pod IP, assigned ports, service-account token contents) and other
+          RHAZARD-refreshed state (§5.6); and volume CONTENTS (the data lives in the
+          filesystem plane; only mount TOPOLOGY is committed, above). An annotation
+          that materially changes runtime execution is NOT informational and MUST be
+          committed (SR-5).
 
 ⸻
 
@@ -2684,7 +3065,7 @@ ENC-WI-1: Fields are taken from atelet.WorkloadSpec (which carries them); ateom'
 Per-architecture, external-plane identity of the runtime assets (§2.5).
 
   magic "LSP1"; version u16=1; sandbox_class (varbytes); goarch (varbytes);
-  assetCount u64; assets (SORTED by name bytes) — each: name (varbytes),
+  assetCount u64; assets (SORTED by name bytes), each: name (varbytes),
   asset_sha256 (32). AssetFile.url is excluded (transport hint, not identity).
   sandbox pin = sha256 over these bytes (external plane, §2.1).
 
@@ -2704,11 +3085,17 @@ ENC-CONF-2: A reference oracle (a non-production tool sharing the Terrapin core)
             SHOULD emit the vector set as the cross-implementation conformance
             target, covering: the §15.3 Terrapin vectors; LLT1 cases (sorted
             entries, xattrs, hardlink pair, sparse vs dense same identity,
-            zero-length file, and the reject cases — absolute/NUL/".." paths,
+            zero-length file, and the reject cases: absolute/NUL/".." paths,
             duplicate path, bad type, duplicate xattr, mtimeNsec overflow, count
             mismatch, trailing bytes); LLAY1 cases (tiling extents, virtual-zero,
-            empty/inline/hardlink, and its reject cases); and at least one round
-            trip for LLSR1/LLBD1/LLMD1/LLFD1/LLWI1/LLSP1 plus their reject cases.
+            empty and hardlink files, plus the reject cases including backing==2 /
+            non-zero inlineCount, which are reserved in v1, LLAY1-11); a memory-layout
+            (LLML1) case with a mapped-data region at a HIGH guest address preceded by
+            a very large unmapped/no-access zero span (to catch tree-height and
+            off-by-one bugs in the virtual zero-subtree proof rules, SPARSE-8), plus a
+            mapped-zero vs unmapped state-mismatch reject case; an LLSR1 round trip
+            WITH a non-none runtime delta (LLRD1) present; and at least one round trip
+            for LLSR1/LLBD1/LLMD1/LLFD1/LLRD1/LLWI1/LLSP1 plus their reject cases.
 ENC-CONF-3: The production digest-producing code SHOULD be a single implementation
             (the digest boundary is the language boundary) so independent
             implementations cannot silently diverge; the oracle's vectors are the
@@ -2719,82 +3106,112 @@ ENC-CONF-3: The production digest-producing code SHOULD be a single implementati
 16. Phase plan and minimal viable surface
 
 The core bet: injecting exactly the right verified bytes at startup/resume beats
-making the pipe wider. The phasing proves that bet first (latency on one node),
-then hardens it (production rollouts), then scales it (fan-out), then optimizes it
-(native backends). Each phase has a success criterion.
+making the pipe wider, and density comes from ONE verified base shared
+copy-on-write across many sandboxes. The first gate is therefore a single
+capability, not the whole lifecycle surface: shared-copy-on-write base memory in
+gVisor (§11.2 GVISOR-3). Phase 1 proves exactly that gate on one node (nothing
+more); Phase 2 builds the persisted lifecycle and production latency on top;
+Phase 3 adds yield, fan-out, and fleet behavior; Phase 4 optimizes with native
+backends. Each phase has a success criterion.
 
 ⸻
 
-16.1 Phase 1 — MVP latency proof (one node)
+16.1 Phase 1: prove the density gate (one node)
 
-Build the verified-state substrate end to end on a single node, both planes:
+Phase 1 is NOT the full lifecycle product; it is the shortest path to proving the
+density mechanism, built as a dependency ladder:
 
-  Identity & encodings: the two digest planes (§2); Terrapin profile + verification
-    (§2.2); LLT1 + LLAY1 + the agent-state encodings LLSR1/LLBD1/LLMD1/LLFD1/LLWI1/
-    LLSP1 (§15); a conformance oracle emitting the §15.3 vectors (§15.10).
-  Filesystem plane: materialization → logicalRootfsDigest (§3); content-addressed
-    layout → layoutDigest (§4); content objects + sparse/zero + small-file inline;
-    CAS-backed read path with verify-before-expose, singleflight, P0 priority,
-    hedged fetch + origin breaker, registry/mirror fallback (§8); FUSE (or gVisor
-    gofer) lower + OverlayFS upper + copy-up policy (§4.5).
-  Memory plane: base memory snapshot (2 MiB linear) + base descriptor (§5);
-    copy-on-write restore with the absent/zero hazard handling and verification
-    (§5.4); restore working set prehydration (§5.5); restore hazards RHAZARD-1..7
-    (§5.6).
-  Agent state: overlay→delta capture; State Root + lineage + fork (§6.1–§6.3); the
-    write/commit path with the single freeze barrier (§6.4); reset / hibernate /
-    yield with the non-cooperative tenet (§6.5); local/external tiers + run modes
-    (§6.6).
-  Startup/resume: profiles, runtime requirements, packs, bootstrap (zero metadata
-    round-trip), coverage, TTFE/TTR decomposition (§7).
-  Control plane: the ateapi SnapshotInfo → StateRootSnapshotInfo migration +
-    SnapshotPlacement + CreateActorRequest.from_state_root + the Checkpoint/Restore
-    State-Root binding or imagefsd adapter (§12) — REQUIRED Phase-1 proto/RPC
-    deliverables.
-  Runtime: the gVisor adapter — reuse background-restore + CAS-backed gofer, plus
-    the one net-new SHARED COPY-ON-WRITE BASE capability (§11.2 GVISOR-3) and the
-    base compatibility matrix (§11.4). This shared-CoW backing is the sole hard
-    runtime dependency and the density mechanism; without it the density thesis
-    fails.
-  Cache/GC & security: cache domains + private-domain keying + leases + mark-sweep
-    GC (§9); the verify-every-byte security model + revocation (§14); the TTFE/TTR
-    + lazy-materialization observability (§13).
+  Rung 1 - Verified lazy filesystem. Terrapin verification (§2.2) + LLT1/LLAY1
+    (§3, §4) served through a CAS-backed gofer (gVisor) or FUSE lower with
+    verify-before-expose lazy reads, singleflight, P0 priority, hedged fetch +
+    origin breaker, registry/mirror fallback (§8); OverlayFS upper + copy-up (§4.5).
+    A conformance oracle emits the §15 vectors (§15.10). Gate: a multi-GiB image
+    execs without full hydration; every exposed byte verifies.
+  Rung 2 - Lazy restore page delivery. Reuse gVisor background restore (§11,
+    GVISOR-2) with the page source redirected into the CAS-backed gofer/page
+    provider: a base memory snapshot (§5.1, §5.3) faults lazily, verify-before-
+    expose, with the absent / known-zero / unmapped hazard handling (§5.4
+    COW-6/6a/6b) and the restore working set (§5.5). Pages are still materialized
+    per sandbox here; density arrives at rung 3. Gate: a sandbox restores and runs
+    faulting only what it touches, and an absent range never reads as zero.
+  Rung 3 - Shared copy-on-write base (THE DENSITY GATE). The one net-new runtime
+    capability (§11.2 GVISOR-3): N sandboxes MAP_PRIVATE one verified base file so
+    resident base pages are physically shared and only written pages go private.
+    Until this passes, everything above is a latency optimization, not a density
+    breakthrough. Gate: the acceptance test below passes.
 
-  Do NOT build P2P first.
+  Do NOT build P2P, fork, yield, or the full delta/State-Root lifecycle in Phase 1.
+  The control-plane binding (§12) lands in Phase 2 with hibernate/resume.
 
-  Success: a multi-GiB image execs, and a hibernated agent resumes, using the
-  bootstrap + pack + base copy-on-write WITHOUT full hydration, while every
-  exposed byte verifies against a Terrapin identifier; P0 faults do not stampede
-  origin; startup/resume need no metadata round trip; and N agents on one node
-  share one verified base (memory + filesystem) with only per-agent deltas private.
+Acceptance test (the density gate, deliberately brutal). Restore N sandboxes from
+one base and prove:
+  - a base block is FETCHED once and VERIFIED once, independent of N (verification
+    cost does not scale with agent or fault count, MVERIFY-2);
+  - the same host PHYSICAL pages back all N sandboxes (one resident copy per cache
+    domain, COW-1/COW-3);
+  - a write creates a private page for the writer ONLY (copy-on-write, no bleed);
+  - an absent (not-yet-fetched) range NEVER reads as zero: it traps, fetches, and
+    verifies before exposure (COW-6/6a);
+  - a signed known-zero range installs a verified zero page with NO fetch (COW-6b),
+    distinguished from absent by the signed layout (MEM-5), never by a memfd hole.
+If this passes, the density thesis is real; if not, the rest is a lazy checkpoint
+reader, not a density substrate.
 
-⸻
-
-16.2 Phase 2 — production latency
-
-Add: RAM CAS; an eBPF/VFS startup+resume profiler and dynamic profile refinement;
-scheduler warmth scoring + resume affinity (§10); controller-driven prewarm;
-registry metadata cache; derived-attested as the default assurance mode (§3).
-
-  Success: p99 foreground-fault and p99 memory-fault latency stay bounded across
-  realistic rollouts; profile drift is detected and re-profiled.
+Measurement harness (the first prototype, before any platform features). Not a
+control plane: a harness around the shared base. Launch a multi-GiB warmed gVisor
+workload, capture a base, restore many sandboxes, and report base resident bytes,
+proportional set size (PSS) per sandbox, dirty pages per sandbox, Terrapin
+verification count, foreground memory-fault p50/p95/p99, absent-range fault
+behavior, known-zero behavior, and TTR (§7.6). These numbers, not a feature list,
+are what distinguish a real density substrate from a merely lazy restore.
 
 ⸻
 
-16.3 Phase 3 — massive fan-out
+16.2 Phase 2: persisted lifecycle and production latency
 
-Add: the peer protocol (§8.6); rack/AZ-aware source selection and seed-node
-rollout planning; peer health scoring; cross-domain peer policy; cluster-wide
-origin-hedge budget coordination and origin breakers at scale; fork fan-out at
-scale (§10.4).
+Build the persisted lifecycle on the proven base, then harden latency.
 
-  Success: origin-registry bytes per 1,000-node rollout drop substantially while
-  TTFE/TTR stay within SLO; a fork of one agent into N children fans out from
-  peers, not origin.
+  Lifecycle: overlay→delta capture (§6.1: memory, filesystem, and runtime deltas)
+    with self-contained deltas (DELTA-5); the
+    write/commit path under the single freeze barrier (§6.4); State Root mint +
+    hibernate/resume (§6.2, §6.5) with local/external tiers and run modes (§6.6);
+    then copy-on-write FORK (§6.3) with the authorization hook (FORK-5). Control
+    plane: the ateapi SnapshotInfo → StateRootSnapshotInfo migration,
+    SnapshotPlacement, CreateActorRequest.from_state_root, and the
+    Checkpoint/Restore State-Root binding (§12) are REQUIRED here.
+  Latency hardening: RAM CAS; an eBPF/VFS startup+resume profiler and dynamic
+    profile refinement; scheduler warmth scoring + resume affinity (§10);
+    controller-driven prewarm; registry metadata cache; derived-attested as the
+    default assurance mode (§3).
+
+  Success: a hibernated agent resumes from its delta + shared base with no full
+  hydration and every byte verified; a fork fans one snapshot into N children; and
+  p99 foreground-fault and memory-fault latency stay bounded across realistic
+  rollouts while profile drift is detected and re-profiled.
 
 ⸻
 
-16.4 Phase 4 — native performance path
+16.3 Phase 3: yield, fan-out, and fleet
+
+Add yield and scale out.
+
+  Yield: hibernate-under-upstream-call plus the durable upstream transaction (§6.5
+    YIELD-1..3) with at-most-once submission and the sent_unknown state machine
+    (YIELD-2/2a).
+  Fleet: the peer protocol (§8.6); rack/AZ-aware source selection and seed-node
+    rollout planning; peer health scoring; cross-domain peer policy; cluster-wide
+    origin-hedge budget coordination and origin breakers at scale; fork fan-out at
+    scale (§10.4). Do NOT build P2P before this phase.
+
+  Success: a blocked agent yields its RAM and wakes to deliver the held response
+  with no duplicate non-idempotent upstream execution beyond declared policy; and
+  origin-registry bytes per 1,000-node rollout drop substantially while TTFE/TTR
+  stay within SLO, a fork of one agent into N children fanning out from peers, not
+  origin.
+
+⸻
+
+16.4 Phase 4: native performance path
 
 Evaluate native, page-cache-integrated backends (optimized FUSE, EROFS/fscache,
 composefs-style verified trees, virtiofs) per §11.5, and the in-place-rewind reset
@@ -2808,7 +3225,10 @@ optimization (§6.5 RESET-4) only if measured to beat restore-fresh.
 
 16.5 Minimal viable surface
 
-The first useful implementation needs, in dependency order: (1) the two digest
+The minimal viable surface is the complete v1 component set, in dependency order
+below. Phase 1 (§16.1) builds only the density-gate subset: items (1)-(4) plus the
+shared-CoW base of (10); the persisted lifecycle of (5) lands in Phase 2 and the
+fleet items (8)-(9) and yield in Phases 2-3. (1) the two digest
 planes + Terrapin verification (§2); (2) materialization + LLT1 (§3); (3)
 content-addressed layout + LLAY1 (§4); (4) the base memory snapshot + CoW restore
 + RHAZARD (§5); (5) overlay/delta + State Root + lineage + fork + reset/hibernate/
@@ -2854,16 +3274,17 @@ Canonical terms (the only terms this document uses for stored state and lifecycl
                         (Subsumes the earlier "checkpoint manifest".)
   overlay               Live per-agent writable layer (dirty pages + fs upper);
                         ephemeral, never in shared CAS. (Was: "divergence".)
-  delta                 Persisted content-addressed snapshot of an overlay (memory
-                        delta = a page MAP naming each diverged page's source —
-                        this-delta/parent/base/zero — §15 LLMD1; filesystem delta =
-                        overlay-delta object: content-object refs + namespace/
-                        metadata ops + whiteouts, §15 LLFD1). (Was: "plane
+  delta                 Persisted content-addressed snapshot of an overlay, in three
+                        parts: memory delta = a page MAP naming each diverged page's
+                        source (this-delta/ancestor/base/zero, §15 LLMD1); filesystem
+                        delta = overlay-delta object (content-object refs + namespace/
+                        metadata ops + whiteouts, §15 LLFD1); runtime delta = opaque
+                        runtime-native non-memory state (§15 LLRD1). (Was: "plane
                         manifest"; "chunk map" for memory.)
   State Root            Content-addressed identity of a persisted agent snapshot,
                         binding actor + base ref + memory delta + filesystem delta
-                        + sandbox pin + workload identity + run mode + producer +
-                        created + parent.
+                        + runtime delta + sandbox pin + workload identity + run mode
+                        + producer + created + parent.
   actor                 The stable identity of an agent; survives across all of its
                         snapshots' State Roots. A fork allocates a NEW actor (§6.3).
   lineage               Parent-pointer DAG over State Roots; basis of forking.
@@ -2931,7 +3352,7 @@ Canonical terms (the only terms this document uses for stored state and lifecycl
   layoutDigest          Terrapin digest of the canonical physical layout (LLAY1,
                         §4).
 
-Supporting terms (structural objects, committed fields, and infrastructure —
+Supporting terms (structural objects, committed fields, and infrastructure,
 not agent-state object classes, see §2.3):
 
   page                  The platform MMU page (4 KiB on x86-64); the unit of
@@ -2950,13 +3371,14 @@ not agent-state object classes, see §2.3):
   overlay-delta object  The canonical filesystem-delta encoding: content-object
                         refs + namespace/metadata ops + whiteouts (§2.3, §6, §15).
   startup-cohesion object
-                        Optional per-image structural object packing hot
-                        startup-critical small-file bytes for minimal startup
-                        block count; gets no dedup/warmth; additive, never the
-                        sole source of bytes (§4.4). Not a content object.
+                        A per-image structural object that would pack hot
+                        startup-critical small-file bytes for minimal startup block
+                        count; RESERVED in v1 (packs are the v1 mechanism). If ever
+                        defined (LLCOH1): no dedup/warmth, additive, never the sole
+                        source of bytes (§4.4). Not a content object.
   materialization strictness
                         Policy for how much state must be present before a
-                        lifecycle milestone — e.g. startup-only, readiness-
+                        lifecycle milestone, e.g. startup-only, readiness-
                         critical, full-before-ready/exec, lazy-risk-accepted
                         (§5, §7).
   STARTUP_READY         The materialization milestone at which startup-critical
@@ -2970,14 +3392,17 @@ not agent-state object classes, see §2.3):
   assurance mode        The base's supply-chain assurance level (asserted /
                         derived-attested / node-derived; §3, §14); a committed
                         field of the base descriptor.
-  workload identity     The canonical digest of the restore-relevant workload
-                        fields (container name/image/command/env, pause image); a
-                        committed field of a State Root (§6, §15).
+  workload identity     The canonical digest of the restore-visible workload fields
+                        (pause image, hostname, namespace flags, pod/container
+                        security context, and per container name/image/command/args/
+                        env, working dir, run-as user, capabilities, mount/device
+                        topology, and resource limits; LLWI1 v2, §15.8); a committed
+                        field of a State Root (§6).
   run mode              Which planes persist across a lifecycle event: clean,
                         golden, persist-rootfs, or persist-rootfs+memory; a
                         committed field of a State Root (§6.6). NB "golden" is a
                         run-mode name (boot from a shared base memory snapshot),
-                        NOT an object class — "golden memory" as an object is
+                        NOT an object class; "golden memory" as an object is
                         retired.
   producer              The identity recorded in a State Root as having produced
                         it. The attestation-envelope signer MUST equal the
