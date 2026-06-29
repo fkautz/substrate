@@ -75,9 +75,12 @@ C3. [needed] directfs (GVISOR-5): keep directfs DISABLED for the LLIFS lower unt
 
 ## D. Base-file production (checkpoint side)
 
-D1. [needed] Produce the base memory snapshot in MemoryFile-offset (guest-address-
-    linear, LLML1) layout -- the file the MAP_PRIVATE base maps. gVisor's native
-    pages.img is a different format, so this is a new artifact.
+D1. [proto] Produce the base memory snapshot in MemoryFile-offset (guest-address-
+    linear, LLML1) layout -- the file the MAP_PRIVATE base maps. NARROWED by F6: the
+    LIVE memfd is ALREADY offset-linear, so base export is a sparse copy of the live
+    memfd (MemoryFile.ExportLinearBase, prototyped + tested), NOT a scatter of the
+    packed pages.img. Cheap at capture time. To produce a base from an on-disk
+    checkpoint instead, LoadFrom into a MemoryFile then ExportLinearBase.
 
 D2. [needed] Base capture point: warmed, pre-secret (RHAZARD-4), with the runtime-
     state blob + memory layout committed by the base descriptor.
@@ -113,6 +116,15 @@ F4. [found] Elegant restore path from S1: map the base region MAP_PRIVATE (S1/S1
     a private copy; unwritten pages stay shared. No f.file backing of the base range
     is needed for restore. (Bookkeeping A4/A5/A6 still must treat base-range pages
     as shared/clean.)
+F6. [found] The LIVE memfd is offset-linear: chunk i is mapped from f.file at file
+    offset i*chunkSize, so f.file offset O == MemoryFile offset O. The base snapshot
+    is therefore just the live memfd's data extents -- export = sparse copy
+    (SEEK_DATA/SEEK_HOLE), no scatter transform. (The PACKED pages.img of F1 is only
+    the on-disk checkpoint/transport format; the live memfd is linear.) Implemented
+    as MemoryFile.ExportLinearBase and verified by TestExportLinearBaseAndShare
+    (export a populated MemoryFile, then use the exported file as a SharedBaseFile in
+    another MemoryFile and read the content back).
+
 F5. [found][needed] Delta computation. gVisor checkpoints ABSOLUTE state, not
     base-relative. The per-agent memory delta (LLMD1: changed pages vs base) must be
     computed -- either by content-diffing the agent's committed pages against the
@@ -128,10 +140,14 @@ Revised S2/S3 (grounded by F1-F5):
   the base mapping (F4); base-aware bookkeeping (A4/A5/A6).
 
 ## Prototyped so far
-- A1 (shared-base option) and A2/S1b (finer sub-chunk mapping): implemented, compile
-  into runsc (gvisor3-s1.pgalloc.patch), and the copy-on-write semantics are verified
-  by an in-tree bazel test (sharedbase_test.go -> TestSharedBaseCOW PASS: base-backed
-  reads, shared base across two MemoryFiles, private writes leave base file + other
-  MemoryFile unchanged). Everything else above is backlog; A6/B1/B3 (save/restore
-  base-delta split + verify-before-expose) is the heavy remaining work that makes
-  runsc clones actually share.
+- A1 (shared-base option), A2/S1b (finer sub-chunk mapping), and D1/F6
+  (ExportLinearBase base production): implemented, compile into runsc
+  (gvisor3-s1.pgalloc.patch), and verified by in-tree bazel tests
+  (sharedbase_test.go): TestSharedBaseCOW (base-backed reads, shared base across two
+  MemoryFiles, private/COW writes leave base file + other MemoryFile unchanged) and
+  TestExportLinearBaseAndShare (export a populated MemoryFile, then use the exported
+  file as a SharedBaseFile and read it back -- the S2->S1 loop). Both PASS under
+  `bazel test //pkg/sentry/pgalloc:pgalloc_test`.
+- Remaining heavy work: A6/B1 (save+restore base/delta split) and B3
+  (verify-before-expose) -- this is what makes real runsc clones share; plus F5
+  (delta computation) and the MemoryFile bookkeeping (A4/A5).

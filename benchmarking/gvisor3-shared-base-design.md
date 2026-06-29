@@ -75,11 +75,14 @@ The chunk mmap is the easy part. Correctness needs four more things:
   production, a first-class base-region map aligned to LLIFS 2 MiB blocks (decoupled
   from the 1 GiB chunk allocator) is still wanted so the base can fault/verify per
   block. (This is the cheapest place the design changed once implemented.)
-- S2: produce a base memory snapshot file (MemoryFile-offset layout) from a
-  checkpoint. GROUNDED: pages.img is PACKED + sparse and its metadata is gVisor
-  state-encoding (not externally parseable), so S2 is an IN-TREE export that
-  scatters the packed pages to a sparse linear base file. (See
-  gvisor-changes-for-production.md F1-F2.)
+- S2: produce a base memory snapshot file (MemoryFile-offset layout). DONE (proto):
+  the LIVE memfd is already offset-linear (F6), so base export is a sparse copy of
+  the memfd's data extents -- implemented as `MemoryFile.ExportLinearBase` and
+  verified by `TestExportLinearBaseAndShare` (export a populated MemoryFile, then use
+  the exported file as a SharedBaseFile in another MemoryFile and read it back: the
+  S2->S1 loop). No scatter transform needed (the packed pages.img of F1 is only the
+  on-disk checkpoint format). Production: capture at checkpoint time, or LoadFrom an
+  on-disk checkpoint then ExportLinearBase. (See ledger D1, F6.)
 - S3: restore base/delta split -- restore loads only the delta, base via the
   shared mapping; fix MemoryFile bookkeeping for base chunks. GROUNDED: restore
   today loads ALL committed pages (F3); the S1 mapping gives an elegant path --
@@ -92,9 +95,11 @@ The chunk mmap is the easy part. Correctness needs four more things:
   CAS.
 
 ## Status
-Mechanism proven, baseline measured, patch point pinned. S1 + S1b DONE: the
-shared-base MemoryFile option with finer sub-chunk mapping is implemented, compiles
-into runsc, and its copy-on-write semantics pass an in-tree bazel test
-(`gvisor3-s1.pgalloc.patch`, `sharedbase_test.go`). Next: S2/S3 (base-file
-production + restore base/delta split) to realize the flatten through runsc -- the
-full gVisor production backlog is tracked in `gvisor-changes-for-production.md`.
+Mechanism proven, baseline measured, patch point pinned. S1 + S1b + S2 DONE: the
+shared-base MemoryFile option (finer sub-chunk mapping) AND base export
+(ExportLinearBase) are implemented, compile into runsc, and pass in-tree bazel tests
+(`gvisor3-s1.pgalloc.patch`, `sharedbase_test.go`: TestSharedBaseCOW +
+TestExportLinearBaseAndShare). Next: S3 (restore base/delta split: load only the
+delta, map the base, base-aware bookkeeping) -- the heaviest piece, wired into
+runsc's restore + the F5 delta computation, which is what makes real runsc clones
+share. Full gVisor production backlog tracked in `gvisor-changes-for-production.md`.
