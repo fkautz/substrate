@@ -142,7 +142,36 @@ uniformity across a clone set is a residual mitigated only by trust/cache-domain
 boundaries (RHAZARD-7). This sharpens the non-cooperative tenet: clone-safety is
 conditional on the randomness source.
 
-## 7. Status / next
+## 7. Cold-fault verify-before-expose latency (`uffd_latency.c` + sha256 bench)
+
+Measures the cost the lazy-fault thesis depends on: hashing a 2 MiB block on first
+touch before exposing it. On this VM (aarch64, vz):
+
+```
+verify  (GitOID G = sha256 over 2 MiB)     ~0.90 ms/block   2.33 GB/s  (ARMv8 SHA;
+                                                             openssl cross-check 2.33 GB/s)
+populate floor (userfaultfd UFFDIO_COPY     ~1.18 ms/block   1.76 GB/s
+  2 MiB from local base, p99 1.80 ms)
+cold fault + verify (serial, local base)   ~2.1 ms/block
+```
+
+Findings:
+- Verifying is CHEAPER than faulting (2.33 vs 1.76 GB/s) -- verify-before-expose is
+  not the bottleneck; the page-fault populate dominates. Verify adds ~0.9 ms on top
+  of an unavoidable ~1.2 ms populate on the COLD path (~75%).
+- Amortized once per block per node (MVERIFY-2): the Nth clone over an
+  already-verified-resident base pays ~0 for shared base blocks; only its own
+  unique pages fault+verify. Full 1 GiB base verify = ~0.43 s once per node.
+- A ~100 MiB resume working set ~= 50 blocks ~= ~105 ms added to TTR on the first
+  cold restore; near-zero on subsequent clones.
+- Conclusion: "verify every exposed byte" holds at acceptable cost and does not
+  scale with agent count; the dominant cold-start cost is transport (remote fetch),
+  which §8 hedging/prefetch/packs target, not hashing.
+- Caveats: local base (remote fetch adds network latency, orthogonal to verify,
+  hedged per §8); single-threaded handler (parallelizable across vCPUs); 2.33 GB/s
+  is this vz-aarch64 VM.
+
+## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
 - [x] density primitives proven (section 1)
