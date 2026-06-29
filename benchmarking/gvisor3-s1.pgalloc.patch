@@ -11,7 +11,7 @@ index 32f5a76..aefeb73 100644
      library = ":pgalloc",
      deps = [
 diff --git a/pkg/sentry/pgalloc/pgalloc.go b/pkg/sentry/pgalloc/pgalloc.go
-index 43d9c4d..c947f24 100644
+index 43d9c4d..60a0078 100644
 --- a/pkg/sentry/pgalloc/pgalloc.go
 +++ b/pkg/sentry/pgalloc/pgalloc.go
 @@ -384,6 +384,14 @@ type MemoryFileOpts struct {
@@ -27,7 +27,7 @@ index 43d9c4d..c947f24 100644
 +	SharedBaseFile  *os.File
 +	SharedBaseBytes uint64
  }
-
+ 
  // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
 @@ -951,6 +959,34 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
  			m += chunkSize
@@ -62,5 +62,54 @@ index 43d9c4d..c947f24 100644
 +		}
 +	}
  	f.chunks.Store(&newChunks)
-
+ 
  	// Mark void pages free.
+@@ -962,6 +998,48 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
+ 	return nil
+ }
+ 
++// ExportLinearBase writes the committed contents of the MemoryFile to out as a
++// sparse, guest-address-linear base image (out offset O == MemoryFile offset O),
++// usable as MemoryFileOpts.SharedBaseFile in other MemoryFiles (GVISOR-3 S2). The
++// backing memfd is already laid out linearly (chunk i at file offset i*chunkSize),
++// so only its data extents (SEEK_DATA/SEEK_HOLE) are copied and out stays sparse.
++func (f *MemoryFile) ExportLinearBase(out *os.File) (uint64, error) {
++	size := int64(uint64(len(f.chunksLoad())) * chunkSize)
++	if err := out.Truncate(size); err != nil {
++		return 0, err
++	}
++	infd, outfd := int(f.file.Fd()), int(out.Fd())
++	buf := make([]byte, 1<<20)
++	for off := int64(0); off < size; {
++		data, err := unix.Seek(infd, off, unix.SEEK_DATA)
++		if err != nil {
++			break
++		}
++		hole, err := unix.Seek(infd, data, unix.SEEK_HOLE)
++		if err != nil {
++			hole = size
++		}
++		for pos := data; pos < hole; {
++			n := int64(len(buf))
++			if hole-pos < n {
++				n = hole - pos
++			}
++			rn, rerr := unix.Pread(infd, buf[:n], pos)
++			if rn > 0 {
++				if _, werr := unix.Pwrite(outfd, buf[:rn], pos); werr != nil {
++					return 0, werr
++				}
++				pos += int64(rn)
++			}
++			if rerr != nil || rn == 0 {
++				break
++			}
++		}
++		off = hole
++	}
++	return uint64(size), nil
++}
++
+ func (f *MemoryFile) madviseChunkMapping(addr, len uintptr, huge bool) {
+ 	if huge {
+ 		if f.opts.AdviseHugepage {

@@ -1,8 +1,5 @@
-// GVISOR-3 S1b in-tree test (place in pkg/sentry/pgalloc/ of the gVisor tree;
-// add "sharedbase_test.go" to the go_test srcs in pkg/sentry/pgalloc/BUILD).
-// Verifies copy-on-write semantics of the shared base file: base-backed reads,
-// a shared base across two MemoryFiles, and private (COW) writes. PASSES under
-// `bazel test //pkg/sentry/pgalloc:pgalloc_test`.
+// Copyright 2024 The gVisor Authors.
+// LLIFS GVISOR-3 S1b: copy-on-write semantics of a shared base file.
 package pgalloc
 
 import (
@@ -92,5 +89,72 @@ func TestSharedBaseCOW(t *testing.T) {
 	}
 	if got := rd(f1, fr1, 1); got[0] != want {
 		t.Fatalf("f1 did not observe its own write: %x", got[0])
+	}
+}
+
+func TestExportLinearBaseAndShare(t *testing.T) {
+	mkMF := func(opts MemoryFileOpts) *MemoryFile {
+		b, err := os.CreateTemp("", "llifs-mf-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Remove(b.Name())
+		f, err := NewMemoryFile(b, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	src := mkMF(MemoryFileOpts{})
+	defer src.Destroy()
+	fr, err := src.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs, err := src.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pat := make([]byte, 256)
+	for i := range pat {
+		pat[i] = byte(i*7 + 3)
+	}
+	copy(bs.Head().ToSlice(), pat)
+
+	out, err := os.CreateTemp("", "llifs-exported-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(out.Name())
+	defer out.Close()
+	exSize, err := src.ExportLinearBase(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if exSize == 0 {
+		t.Fatal("export produced empty size")
+	}
+	chk := make([]byte, len(pat))
+	if _, err := out.ReadAt(chk, int64(fr.Start)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(chk, pat) {
+		t.Fatalf("exported base content mismatch at off %d", fr.Start)
+	}
+
+	// S2 -> S1: the exported file works as a shared base.
+	dst := mkMF(MemoryFileOpts{SharedBaseFile: out, SharedBaseBytes: exSize})
+	defer dst.Destroy()
+	fr2, err := dst.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bs2, err := dst.MapInternal(fr2, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bs2.Head().ToSlice()[:len(pat)]; !bytes.Equal(got, pat) {
+		t.Fatalf("shared base from export mismatch at fr2=%v", fr2)
 	}
 }
