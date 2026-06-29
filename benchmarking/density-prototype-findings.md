@@ -298,6 +298,52 @@ SaveTo/LoadFrom base/delta code. A runsc-CLI-observable run (threading the base 
 through controller.go/kernel_restore.go + the restore CLI, C1) is the remaining
 integration, deferred as orthogonal to proving the flatten.
 
+## 11. B3: Terrapin verify-before-expose composed with the flatten
+
+Section 10 measured the flatten WITHOUT integrity (a trusted local base). B3 adds
+Terrapin verify-before-expose and shows the two hold TOGETHER.
+`benchmarking/verify_share/` (Go, uses the REAL terrapin-go v0.3, profile
+llifs-terrapin-sha256-v2 via a local replace):
+
+1. Build a base of 2 MiB blocks; compute the per-block GitOID manifest and the
+   whole-base identifier with terrapin.Identifier / IdentifierFromReader.
+2. VERIFY-BEFORE-EXPOSE (node level, once): re-hash every block and check it against
+   the manifest BEFORE any sandbox maps the base.
+3. SHARE: N sandboxes MAP_PRIVATE the verified base; smaps Rss/Pss = the flatten.
+4. TAMPER: flip one byte and re-verify -> the block''s GitOID mismatches and is
+   REJECTED, never exposed.
+
+```
+config                         flatten   Pss     verify (once/node)   tamper
+N=16, base=64MiB, delta=4       8.0x     129MiB  35ms (1.90 GB/s)     rejected @ block
+N=32, base=64MiB, delta=2      15.6x     132MiB  35ms (same, N-indep) rejected @ block
+base terrapin id: terrapin-sha256:a8c4f0ea24fac860f1e4d88b18cd32c4226a01f03b515cd50350c808949c96ac
+```
+
+Findings:
+- Verify-before-expose does NOT change the flatten: 8.0x / 15.6x match the
+  integrity-free section-10 numbers at the same configs. Verification gates whether
+  the shared base is TRUSTED; it does not add resident pages.
+- Verify cost is once PER NODE and independent of N (same 35 ms for a 64 MiB base at
+  N=16 and N=32) -- the MVERIFY-2 amortization, realized. ~1.9 GB/s including file
+  reads + the full terrapin identifier (vs the ~2.33 GB/s bare-sha256 microbench of
+  sec 7; the gap is the tree/manifest construction + I/O). A 1 GiB base verifies in
+  ~0.5 s once per node.
+- Tampering is caught: a single flipped byte changes the block''s GitOID, so the
+  block fails verification and is not exposed. Integrity holds.
+- ARCHITECTURE: verification sits at the NODE level (verify the shared base once,
+  before sandboxes map it), NOT as a per-sandbox userfaultfd handler. A per-sandbox
+  uffd populate would UFFDIO_COPY a PRIVATE page per faulter and defeat sharing; the
+  spec''s "amortized once per block per node" (MVERIFY-2) is exactly node-level
+  verify + per-sandbox MAP_PRIVATE share. So Terrapin verification belongs ABOVE
+  gVisor (the substrate verifies, then hands gVisor a trusted base fd, which pgalloc
+  maps via the B1/B2 overlay). The lazy/remote variant (uffd over a node-shared
+  backing, verifying each block as it is fetched from the CAS, once per node) is the
+  section-8 transport case and reuses this same verify step.
+
+NOTE: verify_share/go.mod uses a local `replace` to /Users/fkautz/src/terrapin-go
+(branch terrapin-v0.3); build it where terrapin-go is checked out (the llifs VM / host).
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
