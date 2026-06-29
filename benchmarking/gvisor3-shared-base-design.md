@@ -115,10 +115,17 @@ The chunk mmap is the easy part. Correctness needs four more things:
   base-identical committed pages are excluded from the pages file and recorded in
   memoryFileSaved.baseBacked (stateify autogen regenerates automatically), verified
   by TestSaveWithBaseExcludesDelta (16 pages, 3 delta -> with-base save writes 3,
-  records 13 base-backed). Next: the LOAD side -- per finding F8, LoadFrom does its
-  OWN mmap and the async loader writes to the memfd FD, so the load side must
-  overlay [0,baseBytes) MAP_PRIVATE in LoadFrom, skip baseBacked from loading, and
-  apply base-range delta over the mapping (COW). This is a distinct, larger piece.
+  records 13 base-backed). Fourth piece done: the LOAD side. LoadFrom gains
+  SharedBaseFile/SharedBaseBytes; it overlays [0,baseBytes) of its own restore
+  mapping MAP_PRIVATE from the base (per F8, LoadFrom maps its own memfd), skips the
+  base-backed set from the page stream (deltaSubRanges, symmetric with save), and
+  applies delta through the mapping (COW for the private base range; write-through
+  beyond baseBytes). Verified by TestRestoreOverBase: the full save->restore base/
+  delta split end to end -- base-backed pages read base content from the overlay,
+  delta pages read delta content, base file unmodified. This uses the SYNCHRONOUS
+  pages path; productionizing means teaching the ASYNC loader (which runsc uses) to
+  apply base-range delta through the mapping instead of the memfd FD (F8) -- that is
+  the remaining wiring before S4 (the N-clone runsc flatten measurement).
 - S4: N-clone runsc test measuring the flatten (expect ~1 x base + N x delta,
   vs the measured 1674 MiB baseline).
 - S5: Terrapin verify-before-expose on base fault-in (userfaultfd), tying in the

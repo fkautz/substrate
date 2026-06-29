@@ -63,17 +63,27 @@ A6. [proto] Save (checkpoint). The save path (save_restore.go) must EXCLUDE
 
 ## B. Restore path (pkg/sentry/pgalloc/save_restore.go + runsc)
 
-B1. [needed] Base/delta split (the big one, S3). Restore must consume (base-file ref
+B1. [proto] Base/delta split (the big one, S3). Restore must consume (base-file ref
     + memory delta) instead of one monolithic pages file: load ONLY the delta into
     non-base chunks; back the base range via the shared `MAP_PRIVATE` mapping; never
     reload base pages. Today restore reloads every page into a private memfd.
-    DESIGN (from F7): record the base-backed set (F5) in memoryFileSaved; SaveTo skips
-    it from the packed pages file; LoadFrom opens the MemoryFile with SharedBaseFile
-    (S1 mapping) and skips the same set from page loading. The skip MUST be symmetric
-    (same walk order both sides) so the packed offsets stay aligned. First piece done:
-    F5 delta computation (BaseBackedRanges) is implemented + tested. Next: wire the
-    skip into SaveTo (A6) and LoadFrom, threading the base-backed set through
-    memoryFileSaved.
+    DONE (proto, SYNC path): the full save->restore base/delta split works end to end
+    through the real SaveTo/LoadFrom. SaveTo records the base-backed set in
+    memoryFileSaved.baseBacked and writes only the delta (A6). LoadFrom gains
+    SharedBaseFile/SharedBaseBytes: it overlays [0,baseBytes) of its restore mapping
+    MAP_PRIVATE from the base (the S1 mmap, applied to LoadFrom's own mapping per F8),
+    skips the base-backed set from the page stream (deltaSubRanges = committed minus
+    baseBacked, symmetric on both sides per F7), and applies delta by writing through
+    the mapping (forEachMappingSlice) -- which COWs the private base range and writes
+    through the shared region beyond baseBytes. Verified by TestRestoreOverBase:
+    base-backed pages read NON-ZERO base content (so it came from the overlay, not the
+    fresh memfd or the delta-only stream), delta pages read delta content, and the
+    base file is unmodified (COW isolation). deltaSubRanges with an empty set returns
+    the whole segment, so non-base save/restore wire format is byte-identical.
+    REMAINING (production): this uses the SYNCHRONOUS pages path (LoadOpts.PagesFile
+    nil; base+async is rejected with an error). Productionizing = teach the ASYNC
+    page loader (B2) to apply base-range delta through the mapping (COW) instead of
+    the memfd FD, since runsc uses the async FD path. See F8.
 
 B2. [needed] Async page loader integration. The background/lazy restore page loader
     must skip the base range and operate only on the delta.
@@ -228,6 +238,10 @@ Revised S2/S3 (grounded by F1-F5):
     byte-for-byte -- the harness for the A6/B1/B2 base-backed-skip work.
   - TestSaveWithBaseExcludesDelta: save-side A6 -- with a base, SaveTo writes only
     the 3 delta pages (vs 16 without) and records 13 base-backed in metadata.
+  - TestRestoreOverBase: load-side B1 -- save against a base (delta-only stream) then
+    restore with the base overlaid MAP_PRIVATE; base-backed pages read base content
+    (from the overlay), delta pages read delta content (COW over the mapping), base
+    file unmodified. The full base/delta save->restore split, end to end (sync path).
 - MECHANISM uncertainty for GVISOR-3 is now retired (map-base + export-base +
   apply-delta-over-base + delta-computation all proven in-tree).
 - Remaining is INTEGRATION, not mechanism: B1/B2 (wire the apply path into runsc's

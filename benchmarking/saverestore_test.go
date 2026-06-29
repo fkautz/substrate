@@ -237,3 +237,91 @@ func TestSaveWithBaseExcludesDelta(t *testing.T) {
 		t.Errorf("baseBacked pages: got %d, want %d", bbPages, npages-ndelta)
 	}
 }
+
+// TestRestoreOverBase proves the B1 load side: save against a base (delta-only
+// stream) then restore with the base overlaid MAP_PRIVATE. Base-backed pages must
+// read base content (which is non-zero, so it cannot have come from the fresh memfd
+// or the delta-only stream -- only the overlay), delta pages must read delta
+// content (COW-applied over the mapping), and the base file must stay unmodified.
+func TestRestoreOverBase(t *testing.T) {
+	ctx := context.Background()
+	pg := uint64(hostarch.PageSize)
+	const npages = 16
+	deltaPages := map[int]byte{2: 0x22, 8: 0x88, 13: 0xDD}
+	baseVal := func(p int) byte { return byte(p*13 + 1) } // non-zero, distinct
+
+	src := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
+	defer src.Destroy()
+	fr, err := src.Allocate(npages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssl, err := src.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	smem := ssl.Head().ToSlice()
+	for p := 0; p < npages; p++ {
+		for i := 0; i < int(pg); i++ {
+			smem[p*int(pg)+i] = baseVal(p)
+		}
+	}
+
+	base, err := os.CreateTemp("", "llifs-base-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(base.Name())
+	defer base.Close()
+	bsz, err := src.ExportLinearBase(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Apply delta AFTER export.
+	for p, v := range deltaPages {
+		for i := 0; i < int(pg); i++ {
+			smem[p*int(pg)+i] = v
+		}
+	}
+
+	// SAVE against the base, synchronous (PagesFile nil) -> stream holds only delta.
+	var meta bytes.Buffer
+	if err := src.SaveTo(ctx, &meta, &SaveOpts{ExcludeCommittedZeroPages: true, SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+
+	// RESTORE with the base overlaid.
+	dst := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
+	defer dst.Destroy()
+	if err := dst.LoadFrom(ctx, bytes.NewReader(meta.Bytes()), &LoadOpts{SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+
+	dsl, err := dst.MapInternal(fr, hostarch.Read)
+	if err != nil {
+		t.Fatalf("dst MapInternal: %v", err)
+	}
+	dmem := dsl.Head().ToSlice()
+	for p := 0; p < npages; p++ {
+		want := baseVal(p)
+		if v, ok := deltaPages[p]; ok {
+			want = v
+		}
+		for i := 0; i < int(pg); i++ {
+			if got := dmem[p*int(pg)+i]; got != want {
+				t.Fatalf("restored page %d byte %d: got %#x want %#x (delta=%v)", p, i, got, want, deltaPages[p] != 0)
+			}
+		}
+	}
+
+	// COW isolation: the base file must be untouched at delta offsets.
+	chk := make([]byte, 1)
+	for p := range deltaPages {
+		if _, err := base.ReadAt(chk, int64(fr.Start)+int64(uint64(p)*pg)); err != nil {
+			t.Fatal(err)
+		}
+		if chk[0] != baseVal(p) {
+			t.Fatalf("base file mutated at page %d: got %#x want %#x", p, chk[0], baseVal(p))
+		}
+	}
+}
