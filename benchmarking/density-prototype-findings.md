@@ -258,6 +258,46 @@ core thesis, measured.
 GO/NO-GO: the N*delta term is small and base sharing holds at scale -> the B1/B2
 restore-path integration is justified. Proceed.
 
+## 10. S4: N-clone flatten through the REAL pgalloc save/restore path
+
+After building the full base/delta split into gVisor's pgalloc (A6 save exclusion +
+B1 load overlay/skip + B2 async loader; see gvisor3-shared-base-design.md), measure
+the actual flatten through that code path. `benchmarking/flatten_test.go`
+(TestNCloneFlatten, in-tree pgalloc test): build one warmed base, ExportLinearBase it,
+save a delta-only checkpoint against it, then restore N MemoryFiles over the ONE
+shared base via the real LoadFrom and read /proc/self/smaps_rollup. One measurement
+gives both footprints: Rss counts the base once PER MAPPING (the would-be no-sharing
+cost ~N*(base+delta)) while Pss counts it once PHYSICALLY (the shared cost
+~base + N*delta), so Rss/Pss is the flatten.
+
+```
+config                       measured   ideal    Pss(actual)  Rss(no-share)  Priv_Dirty
+N=8,  base=128MiB, delta=8     4.9x      5.7x      215 MiB      1057 MiB        93 MiB
+N=16, base=128MiB, delta=4    10.1x     11.0x      206 MiB      2068 MiB        80 MiB
+N=32, base=64MiB,  delta=2    15.0x     16.5x      137 MiB      2061 MiB        73 MiB
+```
+
+Findings:
+- The base is PHYSICALLY shared through the real restore path: Pss is far below Rss
+  (e.g. 206 vs 2068 MiB at N=16). If the base were not shared, Pss would equal Rss.
+  Pss vs Rss is the authoritative proof; the smaps Shared_Clean bucket reads ~0-4 MiB
+  (a classification quirk for MAP_PRIVATE file pages), but Pss accounts the shared
+  base once regardless.
+- Measured flatten is consistently ~90% of the ideal N*(base+delta)/(base+N*delta);
+  the gap is a fixed ~15-30 MiB of Go runtime + page tables for the N mappings, which
+  amortizes as base grows. Private_Dirty tracks ~N*delta (the per-clone COW pages).
+- Flatten scales with N and inversely with delta -- density is DELTA-bound, not
+  base-bound, confirmed end to end through the gVisor code path (not just the raw
+  kernel primitive of section 1).
+- Cross-check with the real-workload delta (section 9, ~8.6 MiB read-mostly delta over
+  a 514 MiB base): at N=32 that is an ideal ~21x flatten; this synthetic run confirms
+  the mechanism realizes ~90% of such ratios.
+
+This is S4 at the pgalloc layer (where the sharing physically happens), using the real
+SaveTo/LoadFrom base/delta code. A runsc-CLI-observable run (threading the base image
+through controller.go/kernel_restore.go + the restore CLI, C1) is the remaining
+integration, deferred as orthogonal to proving the flatten.
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
