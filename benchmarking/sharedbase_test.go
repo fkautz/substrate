@@ -247,3 +247,77 @@ func TestBasePlusDeltaRestore(t *testing.T) {
 		t.Fatalf("clone B (no delta) want AA,BB got %x,%x", bb[0], bb[pg])
 	}
 }
+
+// TestBaseBackedRangesDelta validates the F5 delta computation: of N committed
+// pages filled to match a base, only the pages modified AFTER export are reported
+// as delta; the rest are base-backed (skippable on save, base-mapped on restore).
+func TestBaseBackedRangesDelta(t *testing.T) {
+	pg := uint64(hostarch.PageSize)
+	b, err := os.CreateTemp("", "llifs-mf-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(b.Name())
+	src, err := NewMemoryFile(b, MemoryFileOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Destroy()
+
+	const npages = 8
+	fr, err := src.Allocate(npages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl, err := src.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := sl.Head().ToSlice()
+	for p := 0; p < npages; p++ {
+		for i := 0; i < int(pg); i++ {
+			mem[p*int(pg)+i] = byte(p*7 + 1) // distinct, non-zero per page
+		}
+	}
+
+	base, err := os.CreateTemp("", "llifs-base-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(base.Name())
+	defer base.Close()
+	bsz, err := src.ExportLinearBase(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Modify pages 2 and 5 AFTER export: these become the delta.
+	mem[2*int(pg)] ^= 0xFF
+	mem[5*int(pg)+10] ^= 0xFF
+
+	bb, err := src.BaseBackedRanges(base, bsz)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bbPages uint64
+	for _, r := range bb {
+		bbPages += r.Length() / pg
+	}
+	if bbPages != npages-2 {
+		t.Fatalf("want %d base-backed pages, got %d (%v)", npages-2, bbPages, bb)
+	}
+	covered := func(off uint64) bool {
+		for _, r := range bb {
+			if off >= r.Start && off < r.End {
+				return true
+			}
+		}
+		return false
+	}
+	if covered(fr.Start+2*pg) || covered(fr.Start+5*pg) {
+		t.Fatalf("a delta page was wrongly marked base-backed: %v", bb)
+	}
+	if !covered(fr.Start+0*pg) || !covered(fr.Start+7*pg) {
+		t.Fatalf("an unmodified base page is missing from base-backed set: %v", bb)
+	}
+}
