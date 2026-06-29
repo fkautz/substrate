@@ -169,10 +169,17 @@ SENTRYs chunk.mapping, but the GUESTs memory is mapped by the platform
 loader writes delta into the sentry overlay (COW), leaving the memfd holey for the base
 range, so the guest reads zeros and crashes. Normal restore (no base) is unaffected.
 
-Therefore the base/delta share + the sec-10 ~10x flatten are on the SENTRY mapping, NOT
-guest-observable. The fix: apply the same MAP_PRIVATE+COW base primitive at the
-DataFD/MapFile layer -- per-sandbox memfd holds only the delta; MapFile maps base-range
-pages MAP_PRIVATE from the shared base fd into the guest (COW), delta MAP_SHARED from the
-memfd. Needs a memmap.File/DataFD base-range notion + a systrap MapFile change. The C1
-restore-side CLI/FD plumbing (c1-restore-plumbing.patch) is correct and reusable. See
-ledger F9 for the full analysis and the next step.
+RESOLUTION (platform-dependent): the overlay is correct for KVM, not systrap.
+- KVM addressSpace.MapFile maps the guest from f.MapInternal(fr) = the SENTRY
+  chunk.mapping (what the overlay modifies). One process per sandbox; MAP_PRIVATE base +
+  COW is coherent and shares across sandboxes via the page cache. So S1/B1/B2 and the
+  ~10x flatten ARE guest-observable on KVM as-is (code-confirmed; untestable here -- no
+  /dev/kvm under Apple vz).
+- systrap MapFile maps the guest from f.DataFD()=the per-sandbox memfd into a SEPARATE
+  stub (no CLONE_VM); the sentry overlay is invisible to the stub, and MAP_PRIVATE-base
+  in both desyncs on base-range writes. systrap needs KSM (MADV_MERGEABLE; opportunistic,
+  no Terrapin integration) or a deeper coherent shared-base+delta mechanism.
+NET: GVISOR-3 base/delta + overlay is the right design for KVM (where LLIFS density
+matters most); the systrap crash is because the test was forced onto systrap (no nested
+KVM). The C1 restore-side plumbing (c1-restore-plumbing.patch) is platform-agnostic and
+reusable. See ledger F9 for the full analysis.
