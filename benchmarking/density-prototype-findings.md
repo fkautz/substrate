@@ -344,6 +344,53 @@ Findings:
 NOTE: verify_share/go.mod uses a local `replace` to /Users/fkautz/src/terrapin-go
 (branch terrapin-v0.3); build it where terrapin-go is checked out (the llifs VM / host).
 
+## 12. B3 lazy/remote: userfaultfd CAS-fetch + Terrapin-verify, once per node
+
+Section 11 verified the base EAGERLY (re-hash all blocks before mapping). The
+lazy/remote variant is the transport case (spec COW-6/6a + sec 8): blocks are
+fetched from a content-addressed store ON DEMAND, verified, and installed into a
+node-shared backing only when first accessed. `benchmarking/lazy_verify/` (Go, real
+terrapin-go v0.3, hand-rolled userfaultfd; Linux/uffd):
+
+- A memfd is the NODE-SHARED base backing, mapped MAP_SHARED and registered with a
+  userfaultfd in MISSING mode.
+- A handler goroutine serves MISSING faults: map the faulting 2 MiB block to its
+  Terrapin GitOID, fetch the bytes from the CAS, recompute the GitOID
+  (verify-before-expose), and UFFDIO_COPY into the shared backing -- or UFFDIO_ZEROPAGE
+  for known-zero blocks (no fetch). A tampered CAS entry (content != its GitOID key)
+  is detected and NOT exposed.
+- After population, N sandboxes MAP_PRIVATE the shared backing -> the flatten.
+
+```
+base=32MiB, 16 blocks (1 known-zero, 1 tampered):
+  fetches=15  verifies=15  zero-installs=1  rejects=1
+  once-per-node: re-touching every block added 0 fetches
+  tamper:    block 8 (corrupted in CAS) REJECTED by verify, not exposed
+  known-zero: block 4 installed via UFFDIO_ZEROPAGE, no fetch
+  share N=16:  Rss=575MiB  Pss=63MiB   FLATTEN= 9.1x
+  share N=32:  Rss=1087MiB Pss=63MiB   FLATTEN=17.3x
+```
+
+Findings:
+- Lazy fault-driven fetch works through userfaultfd: a block is fetched + verified
+  only on first access. Re-touching every block adds ZERO fetches -> population is
+  ONCE PER NODE; the fetch/verify count (15) is independent of the sandbox count N.
+  This is the MVERIFY-2 amortization in the transport path.
+- Verify-before-expose holds in the fault handler: the fetched bytes are Terrapin-
+  verified BEFORE UFFDIO_COPY exposes them. A single corrupted byte changes the
+  block''s GitOID, so the block is rejected and never installed.
+- Known-zero blocks install via UFFDIO_ZEROPAGE with no CAS fetch (zero-skip).
+- It composes with the flatten: Pss stays ~constant (the base resident once per node)
+  while Rss grows with N, so the flatten scales (9.1x@N=16, 17.3x@N=32) -- exactly the
+  node-level model (verify+populate once, MAP_PRIVATE share N).
+- This is the same architecture as sec 11 (node-level verify, then share); the only
+  difference is WHEN/HOW the shared backing is populated (lazy uffd from a CAS vs
+  eager full-base verify). The CAS here is in-process (freed before the rollup, since
+  it stands in for a remote store); a real deployment fetches from the §8 CAS/packs.
+
+NOTE: lazy_verify/go.mod uses a local `replace` to /Users/fkautz/src/terrapin-go
+(branch terrapin-v0.3); uffd ioctl numbers and syscall nrs are for linux/arm64.
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
