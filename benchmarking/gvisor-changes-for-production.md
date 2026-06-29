@@ -269,9 +269,32 @@ F9. [found][CRITICAL] The base overlay must live at the DataFD/MapFile layer (th
       kernel_restore threading base.img -> LoadOpts) is correct and REUSABLE; only the
       overlay LAYER (currently pgalloc LoadFrom) must move to MapFile/DataFD. Normal
       restore (no base.img) is unaffected (regression verified: tick continued).
-    NEXT: redo the overlay at the platform layer -- teach DataFD to report base ranges
-    and systrap MapFile to MAP_PRIVATE base-range pages from the shared base fd; then
-    re-run the runsc end-to-end and the flatten will be guest-observable.
+    RESOLUTION (platform-dependent -- the overlay is correct for KVM, not systrap):
+    the two platforms back guest memory DIFFERENTLY.
+    - KVM (address_space.go MapFile): maps the guest from f.MapInternal(fr) -- i.e. the
+      SENTRY's chunk.mapping, into the guest page tables via KVM. That IS what the
+      GVISOR-3 overlay modifies. There is ONE process per sandbox (the sentry; the guest
+      runs in a hardware VM fed by the sentry's mappings), so MAP_PRIVATE base + COW is
+      coherent and shares across sandboxes via the page cache. => the S1/B1/B2 overlay
+      and the S4 flatten ARE guest-observable on KVM, as-is. (Code-confirmed; untestable
+      on this Lima VM because Apple vz exposes no /dev/kvm -> systrap only.)
+    - systrap (subprocess.go MapFile): maps the guest from f.DataFD(fr)=the per-sandbox
+      MEMFD into a SEPARATE stub process (clone CLONE_FILES|SIGCHLD, NO CLONE_VM, so
+      sentry+stub are distinct address spaces sharing guest RAM only via MAP_SHARED of
+      the memfd). The sentry-mapping overlay is invisible to the stub. And a clean
+      MAP_PRIVATE-base in BOTH would desync on the first base-range WRITE (per-process
+      COW), breaking sentry/stub coherence. So the overlay approach cannot give
+      guest-observable sharing on systrap.
+    SYSTRAP PATH (separate from the overlay): use KSM -- MADV_MERGEABLE the guest-RAM
+    memfd mappings so the host dedups identical base pages across sandboxes. Correct and
+    simple (a madvise), but opportunistic (scan latency + CPU) and content-based, so it
+    does NOT integrate Terrapin verification (it merges whatever matches, not verified
+    base blocks). Explicit/instant/verified base sharing on systrap would need a
+    coherent shared-base + delta-overlay mechanism across the sentry+stub (e.g.
+    uffd-WP promote-to-shared-delta) -- research-grade, deferred.
+    NET: GVISOR-3 base/delta + overlay is the right design for the KVM platform (where
+    LLIFS density matters most); systrap (a ptrace/seccomp fallback) needs KSM or a
+    deeper mechanism. The C1 restore plumbing is platform-agnostic and reusable.
 
 F8. [found][CORRECTED] LoadFrom bypasses the extendChunksLocked base overlay. On
     restore, LoadFrom does its OWN single mmap of f.file (MAP_SHARED over the whole

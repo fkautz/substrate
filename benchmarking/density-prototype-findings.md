@@ -436,9 +436,24 @@ IMPLICATIONS:
 - This is exactly the kind of issue only an end-to-end run surfaces: the unit tests and
   the sec-10 flatten all read via MapInternal (the sentry view) and so looked correct.
 
-NET: C1 restore plumbing works and regression is clean; the base overlay must move from
-the sentry mapping to the platform/DataFD layer before runsc clones actually share (and
-before the flatten is guest-observable). Tracked as the next step in ledger F9.
+RESOLUTION (platform-dependent; ledger F9): the two platforms back guest memory
+differently, and the overlay is correct for KVM but not systrap.
+- KVM: addressSpace.MapFile maps the guest from f.MapInternal(fr) = the SENTRY
+  chunk.mapping (the thing the overlay modifies), into the guest page tables. One
+  process per sandbox (guest in a HW VM fed by sentry mappings), so MAP_PRIVATE base +
+  COW is coherent and shares across sandboxes via the page cache. => S1/B1/B2 + the
+  sec-10 flatten ARE guest-observable on KVM, as-is. Code-confirmed; untestable on this
+  Lima VM (Apple vz exposes no /dev/kvm, so only systrap runs here).
+- systrap: MapFile maps the guest from f.DataFD()=the per-sandbox memfd into a SEPARATE
+  stub process (clone without CLONE_VM; sentry+stub share guest RAM only via MAP_SHARED
+  of the memfd). The sentry overlay is invisible to the stub, and MAP_PRIVATE-base in
+  both would desync on base-range writes. So the overlay cannot share on systrap; that
+  needs KSM (MADV_MERGEABLE the memfd mappings; opportunistic, content-based, no
+  Terrapin integration) or a deeper coherent shared-base+delta mechanism.
+
+So the test landing on systrap (forced by no nested KVM) is why base.img restore
+crashed; the design is sound for KVM, the platform where LLIFS density matters most.
+The C1 restore plumbing is platform-agnostic and reusable.
 
 ## 8. Status / next
 
