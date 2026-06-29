@@ -298,6 +298,13 @@ SaveTo/LoadFrom base/delta code. A runsc-CLI-observable run (threading the base 
 through controller.go/kernel_restore.go + the restore CLI, C1) is the remaining
 integration, deferred as orthogonal to proving the flatten.
 
+CORRECTION (see sec 13 / ledger F9): this flatten is on the SENTRY''s chunk.mapping.
+The C1 end-to-end run later showed the GUEST maps its memory separately (platform
+MapFile from the per-sandbox memfd via DataFD), so this number is NOT yet a
+guest-observable flatten. The mechanism is right but must be moved to the DataFD/MapFile
+layer to flatten the guest mapping. Treat the ~10x here as the sentry-mapping result
+pending the platform-layer redo.
+
 ## 11. B3: Terrapin verify-before-expose composed with the flatten
 
 Section 10 measured the flatten WITHOUT integrity (a trusted local base). B3 adds
@@ -390,6 +397,48 @@ Findings:
 
 NOTE: lazy_verify/go.mod uses a local `replace` to /Users/fkautz/src/terrapin-go
 (branch terrapin-v0.3); uffd ioctl numbers and syscall nrs are for linux/arm64.
+
+## 13. C1: runsc restore-side base plumbing + the layering finding (F9)
+
+Wired the base image through the real runsc restore path (restore-side slice):
+`runsc restore` now picks up an optional `base.img` in the image-path dir, threads it
+as an FD through sandbox -> boot controller -> kernel_restore LoadOpts.SharedBaseFile
+for the MAIN MemoryFile (c1-restore-plumbing.patch: cmd/sandbox/controller/
+kernel_restore). runsc builds; the plumbing is correct.
+
+End-to-end test (cr_workload, WARM_MB=64, systrap):
+```
+checkpoint at tick=4 -> 67 MiB pages.img
+restore WITHOUT base.img:  tick continues 5,6,7,8,9  checksum=ok   (REGRESSION OK)
+restore WITH  base.img:    container STOPPED, no output            (BROKEN)
+  debug log confirms: "Restoring main MemoryFile over shared base image ... (1 GiB)"
+  restore completes cleanly (all timers), but the workload crashes on resume.
+```
+
+ROOT CAUSE (ledger F9, important): the GUEST''s memory is mapped by the platform, not
+the sentry. systrap subprocess.MapFile does
+mmap(MAP_SHARED|MAP_FIXED, f.DataFD(fr), fr.Start) -- i.e. straight from the
+per-sandbox memfd. The GVISOR-3 base overlay is on the SENTRY''s chunk.mapping (a
+different mapping); the async loader writes delta into THAT overlay (COW), so the memfd
+(f.file) is left holey for the base range, and the guest reads zeros -> crash. The
+overlay is at the wrong LAYER for guest execution.
+
+IMPLICATIONS:
+- The sec-10 flatten (and S1/B1/B2) share the SENTRY chunk.mapping, which is real but
+  is NOT the guest mapping. The platform maps a second, per-sandbox view of guest RAM
+  from the memfd; the prototype does not share that. So the ~10x is a sentry-mapping
+  result, not yet guest-observable.
+- The fix is to apply the SAME MAP_PRIVATE+COW base primitive at the DataFD/MapFile
+  layer: the per-sandbox memfd holds only the delta, and MapFile maps base-range pages
+  MAP_PRIVATE from the shared base fd into the guest (COW), delta pages MAP_SHARED from
+  the memfd. This needs a memmap.File/DataFD base-range notion + a systrap MapFile
+  change. The restore-side CLI/FD plumbing built here is reusable as-is.
+- This is exactly the kind of issue only an end-to-end run surfaces: the unit tests and
+  the sec-10 flatten all read via MapInternal (the sentry view) and so looked correct.
+
+NET: C1 restore plumbing works and regression is clean; the base overlay must move from
+the sentry mapping to the platform/DataFD layer before runsc clones actually share (and
+before the flatten is guest-observable). Tracked as the next step in ledger F9.
 
 ## 8. Status / next
 

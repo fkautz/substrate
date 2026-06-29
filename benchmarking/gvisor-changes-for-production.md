@@ -237,6 +237,42 @@ F5. [found][proto] Delta computation. gVisor checkpoints ABSOLUTE state, not
     each page to test for zero) rather than a separate full re-read, and compare
     against the mmapped base rather than Pread per page.
 
+F9. [found][CRITICAL] The base overlay must live at the DataFD/MapFile layer (the
+    GUEST mapping), NOT the sentry chunk.mapping. Discovered by the first real runsc
+    end-to-end base restore (C1): a normal checkpoint restored WITH a base.img
+    completed cleanly (all restore timers ran, base FD threaded through) but the
+    workload CRASHED immediately (container "stopped", no output), while the same
+    restore WITHOUT base.img resumed correctly (tick continued, checksum ok). Root
+    cause: gVisor maps GUEST memory in the platform stub via
+    systrap subprocess.MapFile -> mmap(MAP_SHARED|MAP_FIXED, f.DataFD(fr), fr.Start),
+    i.e. directly from the per-sandbox memfd (pgalloc DataFD returns f.FD()). The
+    GVISOR-3 prototype overlays the SENTRY''s chunk.mapping (a SEPARATE mapping used
+    for MapInternal / sentry-side guest access), and the async loader writes delta
+    into THAT overlay (COW), leaving f.file holes for the base range. So the guest,
+    mapped from f.file, reads zeros -> crash.
+    CONSEQUENCES:
+    - The S1/B1/B2 overlay and the S4 flatten share the SENTRY chunk.mapping, which is
+      real resident memory but is NOT the guest''s memory mapping. The platform maps a
+      SECOND view of guest RAM from f.file (per-sandbox); the prototype does not share
+      that, and in fact breaks it when a base is supplied. So the measured ~10x flatten
+      is the sentry-mapping flatten, not a guest-observable flatten. (The pgalloc unit
+      tests pass because they read via MapInternal = the sentry view.)
+    - CORRECT design: share the base at the memfd/DataFD/MapFile layer. The per-sandbox
+      memfd holds ONLY the delta; for base-range pages, DataFD/MapFile must map the
+      SHARED base fd MAP_PRIVATE (COW) into the guest, and delta pages MAP_SHARED from
+      the memfd. This requires: (a) a memmap.File/DataFD notion of base-range vs delta,
+      and (b) a platform MapFile change to choose base-fd-MAP_PRIVATE vs memfd-MAP_SHARED
+      per sub-range (and to keep the base immutable across clones via COW). The MAP_PRIVATE
+      +COW mechanism itself (density_smoke, S1) is still the right primitive -- it just
+      must be applied to the GUEST mapping (MapFile), not the sentry bookkeeping mapping.
+    - The C1 restore-side plumbing (c1-restore-plumbing.patch: cmd/sandbox/controller/
+      kernel_restore threading base.img -> LoadOpts) is correct and REUSABLE; only the
+      overlay LAYER (currently pgalloc LoadFrom) must move to MapFile/DataFD. Normal
+      restore (no base.img) is unaffected (regression verified: tick continued).
+    NEXT: redo the overlay at the platform layer -- teach DataFD to report base ranges
+    and systrap MapFile to MAP_PRIVATE base-range pages from the shared base fd; then
+    re-run the runsc end-to-end and the flatten will be guest-observable.
+
 F8. [found][CORRECTED] LoadFrom bypasses the extendChunksLocked base overlay. On
     restore, LoadFrom does its OWN single mmap of f.file (MAP_SHARED over the whole
     fileSize, save_restore.go ~967) and assigns chunk.mapping from it -- it does NOT
