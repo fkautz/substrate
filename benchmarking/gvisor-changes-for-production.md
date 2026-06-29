@@ -122,11 +122,17 @@ B3. [proto] Verify-before-expose (COW-6/6a/6b). Terrapin-verify the 2 MiB blocks
     once, then per-sandbox MAP_PRIVATE share), NOT a per-sandbox uffd handler -- a
     per-sandbox UFFDIO_COPY would make a PRIVATE page per faulter and defeat sharing.
     So Terrapin verification lives ABOVE gVisor (substrate verifies, hands gVisor a
-    trusted base fd; pgalloc just maps it via B1/B2). REMAINING for production: the
-    lazy/remote variant -- a uffd MISSING handler over a NODE-SHARED backing that
-    fetches each absent block from the CAS, verifies it, and populates the shared
-    backing once per node (the sec-8 transport case); plus UFFDIO_ZEROPAGE for
-    known-zero. The verify step itself is this proto.
+    trusted base fd; pgalloc just maps it via B1/B2). LAZY/REMOTE variant also PROTO''d
+    (benchmarking/lazy_verify): a userfaultfd MISSING handler over a node-shared memfd
+    backing fetches each absent 2 MiB block from a CAS keyed by its Terrapin GitOID,
+    verifies it (real terrapin-go) before UFFDIO_COPY, and UFFDIO_ZEROPAGEs known-zero
+    blocks (no fetch). Measured: fetch+verify is ONCE PER NODE (re-touching every block
+    adds 0 fetches; count independent of N), a tampered CAS entry is rejected (not
+    exposed), and it composes with the flatten (9.1x@N=16, 17.3x@N=32 at fixed Pss).
+    REMAINING for production: wire it to a real CAS/packs client (sec-8 transport), and
+    for the gVisor path drive population from the SENTRY''s access to an unpopulated
+    base block (node uffd over the shared backing) rather than the node touching it
+    proactively. The mechanism (uffd fetch+verify+install + zeropage) is proven here.
 
 ## C. runsc CLI / control-plane plumbing
 
