@@ -51,6 +51,13 @@ B1. [needed] Base/delta split (the big one, S3). Restore must consume (base-file
     + memory delta) instead of one monolithic pages file: load ONLY the delta into
     non-base chunks; back the base range via the shared `MAP_PRIVATE` mapping; never
     reload base pages. Today restore reloads every page into a private memfd.
+    DESIGN (from F7): record the base-backed set (F5) in memoryFileSaved; SaveTo skips
+    it from the packed pages file; LoadFrom opens the MemoryFile with SharedBaseFile
+    (S1 mapping) and skips the same set from page loading. The skip MUST be symmetric
+    (same walk order both sides) so the packed offsets stay aligned. First piece done:
+    F5 delta computation (BaseBackedRanges) is implemented + tested. Next: wire the
+    skip into SaveTo (A6) and LoadFrom, threading the base-backed set through
+    memoryFileSaved.
 
 B2. [needed] Async page loader integration. The background/lazy restore page loader
     must skip the base range and operate only on the delta.
@@ -129,11 +136,31 @@ F6. [found] The LIVE memfd is offset-linear: chunk i is mapped from f.file at fi
     (export a populated MemoryFile, then use the exported file as a SharedBaseFile in
     another MemoryFile and read the content back).
 
-F5. [found][needed] Delta computation. gVisor checkpoints ABSOLUTE state, not
+F5. [found][proto] Delta computation. gVisor checkpoints ABSOLUTE state, not
     base-relative. The per-agent memory delta (LLMD1: changed pages vs base) must be
     computed -- either by content-diffing the agent's committed pages against the
     base file at snapshot time, or by base-relative dirty-page tracking added to the
-    MemoryFile. This is new work beyond the existing save path.
+    MemoryFile. PROTOTYPED as content-diff: MemoryFile.BaseBackedRanges(base, baseBytes)
+    walks the accounted (memAcct) ranges and returns the coalesced page ranges whose
+    contents are byte-identical to the base; the complement (plus committed pages at
+    or beyond baseBytes) is the delta. Verified by TestBaseBackedRangesDelta (8 pages
+    matching a base, modify 2 after export -> exactly 2 delta / 6 base-backed).
+    FINDING: knownCommitted is a lazy flag (set by UpdateUsage at pgalloc.go:1846, not
+    at Allocate, which inserts memAcct with knownCommitted=false at :888), so delta
+    detection must compare page CONTENT, not trust knownCommitted. Production: the
+    comparison should slot into SaveTo's existing per-page scan (which already reads
+    each page to test for zero) rather than a separate full re-read, and compare
+    against the mmapped base rather than Pread per page.
+
+F7. [found] Save/load symmetry constraint (grounds B1/B2). SaveTo walks f.memAcct
+    segments and appends each committed non-zero page to the pages file in WALK
+    ORDER via asyncWritePages (saveOff bumps by length) -- the pages file is PACKED,
+    position = scan order (confirms F1). The saved metadata (memoryFileSaved) records
+    the accounting SETS, not per-page file offsets. CONSEQUENCE: LoadFrom must
+    reconstruct the same offset mapping by walking the same committed structure in
+    the same order. So a base/delta split must skip the base-backed set SYMMETRICALLY
+    on both save (don't write) and load (don't read), and that set must be recorded
+    in memoryFileSaved so both sides agree. This is the concrete shape of B1.
 
 Revised S2/S3 (grounded by F1-F5):
 - S2 = in-tree "export base in MemoryFile-offset layout": scatter the packed
@@ -155,8 +182,11 @@ Revised S2/S3 (grounded by F1-F5):
   - TestBasePlusDeltaRestore: map a shared base, apply a delta over it (COW), read
     base+delta with isolation; base file immutable; a no-delta clone reads pure base
     -- the S3 restore-apply mechanism (F4).
+  - TestBaseBackedRangesDelta: of 8 committed pages matching a base, modifying 2
+    after export yields exactly 2 delta / 6 base-backed -- the F5 delta computation
+    (BaseBackedRanges).
 - MECHANISM uncertainty for GVISOR-3 is now retired (map-base + export-base +
-  apply-delta-over-base all proven in-tree).
+  apply-delta-over-base + delta-computation all proven in-tree).
 - Remaining is INTEGRATION, not mechanism: B1/B2 (wire the apply path into runsc's
   restore -- LoadFrom skips the base range, loads only the delta), F5/A6 (compute the
   per-agent delta at save time + exclude base pages from the saved image), the

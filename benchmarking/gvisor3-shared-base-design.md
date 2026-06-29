@@ -99,6 +99,14 @@ The chunk mmap is the easy part. Correctness needs four more things:
   only delta pages -- B1/B2/F3), compute the delta at save time (F5/A6), and make
   MemoryFile bookkeeping base-aware for decommit/accounting (A4/A5). The mechanism
   uncertainty is now retired; what is left is integration/plumbing.
+  PROGRESS (B1/B2): the page-file is PACKED in memAcct-walk order (F7), so the
+  base/delta split is a SYMMETRIC skip of a base-backed set on both save and load,
+  recorded in memoryFileSaved. First piece done: F5 delta computation --
+  MemoryFile.BaseBackedRanges(base, baseBytes) returns the base-identical accounted
+  pages (the complement is the delta), verified by TestBaseBackedRangesDelta. The
+  measured read-mostly delta is ~1.7% of base (sec 9 of density-prototype-findings),
+  so the split is worth wiring. Next within S3: skip the base-backed set in SaveTo
+  (A6) and LoadFrom, threading it through memoryFileSaved.
 - S4: N-clone runsc test measuring the flatten (expect ~1 x base + N x delta,
   vs the measured 1674 MiB baseline).
 - S5: Terrapin verify-before-expose on base fault-in (userfaultfd), tying in the
