@@ -133,8 +133,14 @@ The chunk mmap is the easy part. Correctness needs four more things:
   flatten: base-aware bookkeeping (A4/A5 decommit/accounting), runsc CLI plumbing to
   pass the base image + State Root (C1), and then S4 (the N-clone flatten measurement
   vs the 1674 MiB baseline); B3 verify-before-expose layers on after.
-- S4: N-clone runsc test measuring the flatten (expect ~1 x base + N x delta,
-  vs the measured 1674 MiB baseline).
+- S4: N-clone test measuring the flatten (expect ~1 x base + N x delta).
+  DONE at the pgalloc layer (proto): TestNCloneFlatten restores N MemoryFiles over one
+  shared base via the real LoadFrom and reads smaps_rollup; Rss/Pss is the flatten
+  (Rss counts base per-mapping, Pss counts it once physically). Measured 4.9x (N=8),
+  10.1x (N=16), 15.0x (N=32) -- ~90% of the ideal N*(base+delta)/(base+N*delta), the
+  gap a fixed Go+page-table overhead. Density is delta-bound, confirmed through the
+  gVisor code path (sec 10 of density-prototype-findings). A runsc-CLI-observable run
+  (C1) is the remaining integration.
 - S5: Terrapin verify-before-expose on base fault-in (userfaultfd), tying in the
   CAS.
 

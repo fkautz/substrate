@@ -260,6 +260,10 @@ Revised S2/S3 (grounded by F1-F5):
   - TestRestoreOverBaseAsync: B2 -- the same, via the runsc-style ASYNC FD pages file;
     the async loader reads delta into the overlaid mapping (COW). Pages file holds only
     the 3 delta pages; base-backed from overlay, delta COW-applied, base unmodified.
+  - TestNCloneFlatten: S4 -- N MemoryFiles restore one delta-only checkpoint over one
+    shared base via the real LoadFrom; smaps_rollup Rss/Pss shows the flatten. Measured
+    4.9x (N=8), 10.1x (N=16), 15.0x (N=32), ~90% of ideal. The flatten realized through
+    the real gVisor code path.
 - MECHANISM uncertainty for GVISOR-3 is now retired (map-base + export-base +
   apply-delta-over-base + delta-computation all proven in-tree).
 - Remaining is INTEGRATION, not mechanism: B1/B2 (wire the apply path into runsc's
