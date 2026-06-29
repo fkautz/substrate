@@ -30,16 +30,34 @@ A3. [found][needed] Allocate contract conflict. `Allocate` documents "returns
     COW the base away -- base-range allocations must force the uncommitted/base-aware
     path.
 
-A4. [needed] Decommit/eviction for base chunks. `Decommit` does `fallocate`
+A4. [proto] Decommit/eviction for base chunks. `Decommit` does `fallocate`
     punch-hole on `f.file`; base chunks are not backed by `f.file`. Base-range
     decommit must instead `MADV_DONTNEED` the private mapping (drop COW-dirty pages
-    back to the shared base) and never punch `f.file`. Eviction/releaser logic must
-    treat base pages as droppable/clean.
+    back to the shared base) and never punch `f.file`. DONE (proto): decommitOrManuallyZero
+    is now base-aware -- for the [0,SharedBaseBytes) portion of a range it MADV_DONTNEEDs
+    the overlay (per chunk, via forEachChunk + chunk.mapping), reverting COW-dirty pages
+    to the shared base; the beyond-base remainder still fallocate-punches f.file. LoadFrom
+    records the base range on f.opts so post-restore Decommit is base-aware too. Verified
+    by TestBaseDecommitRevertsToBase: COW-write a base page, Decommit it, and it reverts
+    to the shared base content (the fallocate-punch path would have been a no-op, leaving
+    the written value). Production: also make the eviction/releaser path treat base pages
+    as clean/droppable (same MADV path) and validate the recycle/free path does not
+    fallocate the base range (A3 residual).
 
-A5. [needed] Memory accounting. Resident base pages should be accounted as shared
-    (counted once per node), not as per-sandbox committed memory; the per-agent
-    delta (COW-dirty pages) is what counts per agent. `memAcct` / usage reporting
-    must distinguish base vs delta.
+A5. [needed][analyzed] Memory accounting. Resident base pages should be accounted as
+    shared (counted once per node), not as per-sandbox committed memory; the per-agent
+    delta (COW-dirty pages) is what counts per agent. `memAcct` / usage reporting must
+    distinguish base vs delta. ANALYSIS: this is partly a NODE-LEVEL concern a single
+    MemoryFile cannot fully solve -- usage.MemoryAccounting is a per-(kind,cgroup)
+    global, and "count the base once per node" requires knowing about sibling sandboxes.
+    The pgalloc-level piece: a base-range page should be counted as this sandbox''s
+    committed memory only once it is COW-DIRTY (private), not while it is still shared
+    from the base; distinguishing those cheaply needs pagemap/soft-dirty (or tracking
+    COW via the same write path that produces the delta). With A4, decommit of a
+    base-range page already Decs the freed COW pages consistently. Recommended split:
+    (i) pgalloc tags base-range memAcct segments so usage can report base-resident vs
+    delta separately; (ii) the node/substrate layer sums base once across sandboxes
+    sharing the same base id. Deferred until C1 wires real per-node base identity.
 
 A6. [proto] Save (checkpoint). The save path (save_restore.go) must EXCLUDE
     base-range pages from the saved image (they are the shared base, not per-agent
@@ -283,6 +301,9 @@ Revised S2/S3 (grounded by F1-F5):
     shared base via the real LoadFrom; smaps_rollup Rss/Pss shows the flatten. Measured
     4.9x (N=8), 10.1x (N=16), 15.0x (N=32), ~90% of ideal. The flatten realized through
     the real gVisor code path.
+  - TestBaseDecommitRevertsToBase: A4 -- decommitting a COW-written base page MADV_DONTNEEDs
+    the overlay so it reverts to the shared base (not a fallocate-punch no-op); base file
+    untouched.
 - MECHANISM uncertainty for GVISOR-3 is now retired (map-base + export-base +
   apply-delta-over-base + delta-computation all proven in-tree).
 - Remaining is INTEGRATION, not mechanism: B1/B2 (wire the apply path into runsc's

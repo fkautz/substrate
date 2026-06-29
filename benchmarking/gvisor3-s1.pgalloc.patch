@@ -20,7 +20,7 @@ index 32f5a76..7aacccc 100644
      ],
  )
 diff --git a/pkg/sentry/pgalloc/pgalloc.go b/pkg/sentry/pgalloc/pgalloc.go
-index 43d9c4d..2ca3852 100644
+index 43d9c4d..a47d7b5 100644
 --- a/pkg/sentry/pgalloc/pgalloc.go
 +++ b/pkg/sentry/pgalloc/pgalloc.go
 @@ -23,6 +23,7 @@
@@ -184,8 +184,40 @@ index 43d9c4d..2ca3852 100644
  func (f *MemoryFile) madviseChunkMapping(addr, len uintptr, huge bool) {
  	if huge {
  		if f.opts.AdviseHugepage {
+@@ -1132,6 +1265,31 @@ func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
+ }
+ 
+ func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
++	// GVISOR-3 (A4): base-range pages are served by the MAP_PRIVATE base overlay,
++	// not by f.file. Drop them with MADV_DONTNEED, which frees any COW-dirty private
++	// copies and reverts the range to the shared base on next access; fallocate-
++	// punching f.file would not affect the overlay. Pages beyond the base (or with no
++	// base) are decommitted normally via f.file.
++	if f.opts.SharedBaseFile != nil && fr.Start < f.opts.SharedBaseBytes {
++		baseFR := fr
++		if baseFR.End > f.opts.SharedBaseBytes {
++			baseFR.End = f.opts.SharedBaseBytes
++		}
++		f.forEachChunk(baseFR, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
++			if chunk.mapping == 0 {
++				return true
++			}
++			addr := chunk.mapping + uintptr(chunkFR.Start%chunkSize)
++			if _, _, errno := unix.Syscall(unix.SYS_MADVISE, addr, uintptr(chunkFR.Length()), unix.MADV_DONTNEED); errno != 0 {
++				log.Warningf("MADV_DONTNEED base range %v failed: %v", chunkFR, errno)
++			}
++			return true
++		})
++		if fr.End <= f.opts.SharedBaseBytes {
++			return
++		}
++		fr.Start = f.opts.SharedBaseBytes // decommit the beyond-base remainder below
++	}
+ 	if err := f.decommitFile(fr); err != nil {
+ 		log.Warningf("Failed to decommit %v: %v", fr, err)
+ 		// Zero the pages manually. This won't reduce memory usage, but at
 diff --git a/pkg/sentry/pgalloc/save_restore.go b/pkg/sentry/pgalloc/save_restore.go
-index 163ee5f..d9fb049 100644
+index 163ee5f..f95c26c 100644
 --- a/pkg/sentry/pgalloc/save_restore.go
 +++ b/pkg/sentry/pgalloc/save_restore.go
 @@ -20,7 +20,9 @@ import (
@@ -407,7 +439,7 @@ index 163ee5f..d9fb049 100644
  	mfTimeline.Reached("metadata loaded")
  	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
  
-@@ -973,11 +1031,31 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
+@@ -973,11 +1031,35 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
  			return fmt.Errorf("failed to mmap MemoryFile: %w", errno)
  		}
  		mfTimeline.Reached("mmaped chunks")
@@ -435,11 +467,15 @@ index 163ee5f..d9fb049 100644
 +					return fmt.Errorf("failed to overlay shared base: %w", errno)
 +				}
 +			}
++			// Record the base range on f so Decommit/accounting (A4/A5) treat the
++			// base range as overlay-backed (MADV_DONTNEED), not f.file-backed.
++			f.opts.SharedBaseFile = opts.SharedBaseFile
++			f.opts.SharedBaseBytes = opts.SharedBaseBytes
 +		}
  		madviseWG.Add(1)
  		go func() {
  			defer madviseWG.Done()
-@@ -1062,42 +1140,48 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
+@@ -1062,42 +1144,48 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
  			<-madviseChan
  		}
  		if amfl != nil {
@@ -520,7 +556,7 @@ index 163ee5f..d9fb049 100644
  			}
  		}
  
-@@ -2009,3 +2093,47 @@ func (f *MemoryFile) getClientFileRangeSettings(fileSize uint64) []stateio.Clien
+@@ -2009,3 +2097,47 @@ func (f *MemoryFile) getClientFileRangeSettings(fileSize uint64) []stateio.Clien
  	})
  	return cfrs
  }
