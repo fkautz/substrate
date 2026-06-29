@@ -1157,9 +1157,16 @@ MRESTORE-5: imagefsd MUST report cold-node memory over-fetch (bytes fetched but
 Restoring N agents from one base clones state that MUST NOT be shared. These
 hooks are mandatory, not optional.
 
-RHAZARD-1: Entropy MUST be refreshed on restore (kernel RNG, userspace PRNG
-           seeds, cached nonces/keys derived at capture). Reusing base entropy
-           across agents is a security defect.
+RHAZARD-1: Entropy MUST be safe across clones, but the obligation splits by source.
+           The kernel CSPRNG (getrandom, /dev/urandom) is refreshed by the runtime
+           on restore (gVisor gives fresh per-clone kernel entropy; verified in
+           benchmarking/rhz.go) and needs no hook. USERSPACE PRNG state (math/rand,
+           language stdlib RNGs, cached DRBG/seeds, nonces/keys derived at capture)
+           is CLONED and is the residual hazard: it MUST be reseeded by a cooperative
+           hook, OR the workload MUST source randomness from getrandom, OR the agent
+           MUST be restore-fresh (RESET, §6.5) rather than cloned. Reusing userspace
+           PRNG state across clones is a security defect; clone-safety is therefore
+           CONDITIONAL on the randomness source.
 RHAZARD-2: Time sources MUST be refreshed (monotonic and wall clocks jump
            relative to the base).
 RHAZARD-3: External state captured in the base (open sockets, host fds, in-flight
@@ -1187,6 +1194,16 @@ RHAZARD-7: Before HAZARDS_CLEARED for multi-tenant restore, each of the followin
            language-runtime state (Go scheduler/netpoller, JVM safepoints, Python
            hash seed, OpenSSL/BoringSSL DRBG reseed); capture-time secret scanning
            or a no-secrets-before-capture guarantee (RHAZARD-4).
+RHAZARD-8: Empirically (benchmarking/rhz.go, gVisor systrap), across clones
+           restored from one checkpoint the runtime ALREADY refreshes kernel entropy
+           (getrandom and /dev/urandom give distinct per-clone bytes) and advances
+           the monotonic and wall clocks; but the userspace PRNG state, boot_id, and
+           ASLR layout are IDENTICAL across clones. boot_id MUST be regenerated per
+           clone where workloads key on boot/machine identity; ASLR uniformity across
+           a clone set is a residual mitigated only by trust/cache-domain boundaries
+           absent cooperative re-randomization (RHAZARD-7). This bounds the
+           non-cooperative tenet: a non-cooperating agent is clone-safe only for
+           kernel-CSPRNG randomness and clocks (RHAZARD-1).
 
 ⸻
 
