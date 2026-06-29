@@ -105,8 +105,14 @@ The chunk mmap is the easy part. Correctness needs four more things:
   MemoryFile.BaseBackedRanges(base, baseBytes) returns the base-identical accounted
   pages (the complement is the delta), verified by TestBaseBackedRangesDelta. The
   measured read-mostly delta is ~1.7% of base (sec 9 of density-prototype-findings),
-  so the split is worth wiring. Next within S3: skip the base-backed set in SaveTo
-  (A6) and LoadFrom, threading it through memoryFileSaved.
+  so the split is worth wiring. Second piece done: an in-tree SaveTo->LoadFrom
+  round-trip harness (TestSaveRestoreRoundTrip) that exercises the real packed
+  pages-file + stateify-metadata path, so the base-backed-skip changes can be
+  verified as a unit (pages file = stateio FD writer/reader over a temp file;
+  metadata = a bytes.Buffer; timeline nil; DisableMemoryAccounting to avoid the
+  sentry-global usage accounting). Next within S3: skip the base-backed set in
+  SaveTo (A6) and LoadFrom, threading it through memoryFileSaved, verified by
+  extending the round-trip harness to save with a base and restore over it.
 - S4: N-clone runsc test measuring the flatten (expect ~1 x base + N x delta,
   vs the measured 1674 MiB baseline).
 - S5: Terrapin verify-before-expose on base fault-in (userfaultfd), tying in the

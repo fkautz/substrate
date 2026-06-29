@@ -61,6 +61,14 @@ B1. [needed] Base/delta split (the big one, S3). Restore must consume (base-file
 
 B2. [needed] Async page loader integration. The background/lazy restore page loader
     must skip the base range and operate only on the delta.
+    HARNESS DONE: TestSaveRestoreRoundTrip drives the REAL SaveTo->LoadFrom path
+    end-to-end in-tree (packed pages file via stateio FD writer/reader + stateify
+    metadata over a bytes.Buffer; nil timeline; context.Background), restoring 16
+    pages incl. a zero page (ExcludeCommittedZeroPages) byte-for-byte. This is the
+    verification harness the base-backed-skip changes (A6 save, B1/B2 load) land on.
+    FINDING: SaveTo/LoadFrom touch the global usage.MemoryAccounting (nil outside a
+    full sentry), so unit tests must set MemoryFileOpts.DisableMemoryAccounting -- a
+    reminder that base-vs-delta accounting (A5) lives in that same global path.
 
 B3. [needed] Verify-before-expose on base fault-in (COW-6/6a/6b). A userfaultfd
     MISSING handler over the base region that fetches + Terrapin-verifies the 2 MiB
@@ -185,6 +193,9 @@ Revised S2/S3 (grounded by F1-F5):
   - TestBaseBackedRangesDelta: of 8 committed pages matching a base, modifying 2
     after export yields exactly 2 delta / 6 base-backed -- the F5 delta computation
     (BaseBackedRanges).
+  - TestSaveRestoreRoundTrip: drives the real SaveTo->LoadFrom path (packed pages
+    file via stateio + stateify metadata) and restores 16 pages incl. a zero page
+    byte-for-byte -- the harness for the A6/B1/B2 base-backed-skip work.
 - MECHANISM uncertainty for GVISOR-3 is now retired (map-base + export-base +
   apply-delta-over-base + delta-computation all proven in-tree).
 - Remaining is INTEGRATION, not mechanism: B1/B2 (wire the apply path into runsc's

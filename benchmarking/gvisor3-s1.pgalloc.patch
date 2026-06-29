@@ -1,15 +1,22 @@
 diff --git a/pkg/sentry/pgalloc/BUILD b/pkg/sentry/pgalloc/BUILD
-index 32f5a76..aefeb73 100644
+index 32f5a76..5fdf3f5 100644
 --- a/pkg/sentry/pgalloc/BUILD
 +++ b/pkg/sentry/pgalloc/BUILD
-@@ -207,6 +207,7 @@ go_test(
+@@ -207,10 +207,14 @@ go_test(
      srcs = [
          "pgalloc_64k_test.go",
          "pgalloc_test.go",
 +        "sharedbase_test.go",
++        "saverestore_test.go",
      ],
      library = ":pgalloc",
      deps = [
++        "//pkg/context",
+         "//pkg/hostarch",
+         "//pkg/sentry/memmap",
++        "//pkg/sentry/state/stateio",
+     ],
+ )
 diff --git a/pkg/sentry/pgalloc/pgalloc.go b/pkg/sentry/pgalloc/pgalloc.go
 index 43d9c4d..2ca3852 100644
 --- a/pkg/sentry/pgalloc/pgalloc.go
