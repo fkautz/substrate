@@ -1,5 +1,17 @@
+diff --git a/pkg/sentry/pgalloc/BUILD b/pkg/sentry/pgalloc/BUILD
+index 32f5a76..aefeb73 100644
+--- a/pkg/sentry/pgalloc/BUILD
++++ b/pkg/sentry/pgalloc/BUILD
+@@ -207,6 +207,7 @@ go_test(
+     srcs = [
+         "pgalloc_64k_test.go",
+         "pgalloc_test.go",
++        "sharedbase_test.go",
+     ],
+     library = ":pgalloc",
+     deps = [
 diff --git a/pkg/sentry/pgalloc/pgalloc.go b/pkg/sentry/pgalloc/pgalloc.go
-index 43d9c4d..4e20a4e 100644
+index 43d9c4d..c947f24 100644
 --- a/pkg/sentry/pgalloc/pgalloc.go
 +++ b/pkg/sentry/pgalloc/pgalloc.go
 @@ -384,6 +384,14 @@ type MemoryFileOpts struct {
@@ -17,7 +29,7 @@ index 43d9c4d..4e20a4e 100644
  }
 
  // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
-@@ -951,6 +959,24 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
+@@ -951,6 +959,34 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
  			m += chunkSize
  		}
  	}
@@ -26,12 +38,22 @@ index 43d9c4d..4e20a4e 100644
 +	// MemoryFiles and writes fault to private copies.
 +	if f.opts.SharedBaseFile != nil {
 +		for i := oldNrChunks; i < newNrChunks; i++ {
++			if newChunks[i].mapping == 0 {
++				continue
++			}
++			// Overlay the [0, SharedBaseBytes) portion of this chunk MAP_PRIVATE from
++			// the shared base file; any remainder stays MAP_SHARED on f.file. This
++			// shares sub-1-GiB bases too, since chunkSize is 1 GiB.
 +			off := i * chunkSize
-+			if off+chunkSize > f.opts.SharedBaseBytes || newChunks[i].mapping == 0 {
++			hi := off + chunkSize
++			if hi > f.opts.SharedBaseBytes {
++				hi = f.opts.SharedBaseBytes
++			}
++			if off >= hi {
 +				continue
 +			}
 +			if _, _, errno := unix.Syscall6(unix.SYS_MMAP,
-+				newChunks[i].mapping, uintptr(chunkSize),
++				newChunks[i].mapping, uintptr(hi-off),
 +				unix.PROT_READ|unix.PROT_WRITE,
 +				unix.MAP_PRIVATE|unix.MAP_FIXED,
 +				f.opts.SharedBaseFile.Fd(), uintptr(off)); errno != 0 {
