@@ -159,3 +159,20 @@ bookkeeping base-aware for decommit/accounting (A4/A5). Then S4 (N-clone runsc
 flatten measurement, expect ~1 x base + N x delta vs the measured 1674 MiB baseline)
 and S5 (Terrapin verify-before-expose on base fault-in). Full gVisor production
 backlog tracked in `gvisor-changes-for-production.md`.
+
+## Update (C1 end-to-end): the overlay is at the wrong layer (F9)
+
+The first real runsc end-to-end base restore (C1 restore-side plumbing) revealed a
+LAYERING bug, now the top open item. The GVISOR-3 prototype overlays the base on the
+SENTRYs chunk.mapping, but the GUESTs memory is mapped by the platform
+(systrap MapFile -> mmap MAP_SHARED from the per-sandbox memfd via DataFD). The async
+loader writes delta into the sentry overlay (COW), leaving the memfd holey for the base
+range, so the guest reads zeros and crashes. Normal restore (no base) is unaffected.
+
+Therefore the base/delta share + the sec-10 ~10x flatten are on the SENTRY mapping, NOT
+guest-observable. The fix: apply the same MAP_PRIVATE+COW base primitive at the
+DataFD/MapFile layer -- per-sandbox memfd holds only the delta; MapFile maps base-range
+pages MAP_PRIVATE from the shared base fd into the guest (COW), delta MAP_SHARED from the
+memfd. Needs a memmap.File/DataFD base-range notion + a systrap MapFile change. The C1
+restore-side CLI/FD plumbing (c1-restore-plumbing.patch) is correct and reusable. See
+ledger F9 for the full analysis and the next step.
