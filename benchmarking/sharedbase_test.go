@@ -321,3 +321,69 @@ func TestBaseBackedRangesDelta(t *testing.T) {
 		t.Fatalf("an unmodified base page is missing from base-backed set: %v", bb)
 	}
 }
+
+// TestBaseDecommitRevertsToBase validates A4: decommitting a COW-written base-range
+// page MADV_DONTNEEDs the overlay (reverting it to the shared base) rather than
+// fallocate-punching f.file (which would not touch the overlay -> the written value
+// would wrongly persist).
+func TestBaseDecommitRevertsToBase(t *testing.T) {
+	pg := uint64(hostarch.PageSize)
+	base, err := os.CreateTemp("", "llifs-base-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(base.Name())
+	defer base.Close()
+	page0 := make([]byte, pg)
+	page1 := make([]byte, pg)
+	for i := range page0 {
+		page0[i] = 0xAA
+		page1[i] = 0xBB
+	}
+	base.WriteAt(page0, 0)
+	base.WriteAt(page1, int64(pg))
+
+	b, err := os.CreateTemp("", "llifs-backing-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Remove(b.Name())
+	mf, err := NewMemoryFile(b, MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: 2 * pg, DisableMemoryAccounting: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mf.Destroy()
+	fr, err := mf.Allocate(2*pg, AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sl, err := mf.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mem := sl.Head().ToSlice()
+	if mem[0] != 0xAA || mem[pg] != 0xBB {
+		t.Fatalf("base overlay not in effect: %#x %#x", mem[0], mem[pg])
+	}
+	mem[0] = 0x11 // COW-write page0 -> private dirty
+	if mem[0] != 0x11 {
+		t.Fatalf("COW write not visible: %#x", mem[0])
+	}
+
+	// Decommit page0: should drop the COW copy and revert to the shared base.
+	mf.Decommit(memmap.FileRange{Start: fr.Start, End: fr.Start + pg})
+
+	sl2, err := mf.MapInternal(memmap.FileRange{Start: fr.Start, End: fr.Start + pg}, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := sl2.Head().ToSlice()[0]; got != 0xAA {
+		t.Fatalf("decommit did not revert base page to shared base: got %#x want 0xAA (fallocate-punch no-op bug?)", got)
+	}
+	// The base file itself must be untouched.
+	chk := make([]byte, 1)
+	base.ReadAt(chk, 0)
+	if chk[0] != 0xAA {
+		t.Fatalf("base file mutated by decommit: %#x", chk[0])
+	}
+}
