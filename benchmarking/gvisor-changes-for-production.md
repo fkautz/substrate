@@ -94,6 +94,39 @@ E3. [found][needed] Userspace PRNG state is CLONED -- not fixable transparently;
 E4. [found] ASLR layout identical across clones -- residual; cooperative
     re-randomization only. Mitigated by trust/cache-domain boundaries.
 
+## F. Checkpoint format facts (discovered; ground S2/S3)
+
+F1. [found] pages.img is PACKED + SPARSE, not MemoryFile-offset-linear.
+    `AsyncPagesFileSave.saveOff` writes committed non-zero pages sequentially;
+    `ExcludeCommittedZeroPages` drops zero pages. So a page's pages-file position is
+    NOT its MemoryFile offset.
+F2. [found] The metadata is gVisor `state.Save(memoryFileSaved{unwaste/unfree sets,
+    subreleased, memAcct, chunks})` -- the internal state encoding, NOT an externally
+    parseable struct. CONSEQUENCE: S2 (linearize base) and S3 (delta split) must be
+    IN-TREE gVisor/runsc features; an external checkpoint-rewriting tool is not
+    viable (it would have to reimplement gVisor state decoding).
+F3. [found] Restore `LoadFrom` / `AsyncPagesFileLoad` loads ALL committed pages into
+    the per-sandbox memfd (awaitLoad over [0,max)). S3 must instead load only the
+    delta and back the base via the shared MAP_PRIVATE mapping.
+F4. [found] Elegant restore path from S1: map the base region MAP_PRIVATE (S1/S1b),
+    then WRITE the delta pages over that mapping -> kernel COWs each written page to
+    a private copy; unwritten pages stay shared. No f.file backing of the base range
+    is needed for restore. (Bookkeeping A4/A5/A6 still must treat base-range pages
+    as shared/clean.)
+F5. [found][needed] Delta computation. gVisor checkpoints ABSOLUTE state, not
+    base-relative. The per-agent memory delta (LLMD1: changed pages vs base) must be
+    computed -- either by content-diffing the agent's committed pages against the
+    base file at snapshot time, or by base-relative dirty-page tracking added to the
+    MemoryFile. This is new work beyond the existing save path.
+
+Revised S2/S3 (grounded by F1-F5):
+- S2 = in-tree "export base in MemoryFile-offset layout": scatter the packed
+  pages.img to a sparse linear base file using the in-memory metadata. -> SharedBaseFile.
+- S3 save = exclude base-range pages from the packed file AND from memAcct/metadata;
+  emit only the delta (F5).
+- S3 restore = map base MAP_PRIVATE (S1); load only delta pages, writing them over
+  the base mapping (F4); base-aware bookkeeping (A4/A5/A6).
+
 ## Prototyped so far
 - A1 (shared-base option) and A2/S1b (finer sub-chunk mapping): implemented, compile
   into runsc (gvisor3-s1.pgalloc.patch), and the copy-on-write semantics are verified

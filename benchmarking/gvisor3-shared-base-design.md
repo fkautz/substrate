@@ -76,9 +76,16 @@ The chunk mmap is the easy part. Correctness needs four more things:
   from the 1 GiB chunk allocator) is still wanted so the base can fault/verify per
   block. (This is the cheapest place the design changed once implemented.)
 - S2: produce a base memory snapshot file (MemoryFile-offset layout) from a
-  checkpoint.
+  checkpoint. GROUNDED: pages.img is PACKED + sparse and its metadata is gVisor
+  state-encoding (not externally parseable), so S2 is an IN-TREE export that
+  scatters the packed pages to a sparse linear base file. (See
+  gvisor-changes-for-production.md F1-F2.)
 - S3: restore base/delta split -- restore loads only the delta, base via the
-  shared mapping; fix MemoryFile bookkeeping for base chunks.
+  shared mapping; fix MemoryFile bookkeeping for base chunks. GROUNDED: restore
+  today loads ALL committed pages (F3); the S1 mapping gives an elegant path --
+  map base MAP_PRIVATE then WRITE delta pages over it (kernel COWs each) (F4); the
+  delta must be computed (diff-vs-base or dirty-tracking) since gVisor checkpoints
+  absolute state (F5). (See ledger F1-F5.)
 - S4: N-clone runsc test measuring the flatten (expect ~1 x base + N x delta,
   vs the measured 1674 MiB baseline).
 - S5: Terrapin verify-before-expose on base fault-in (userfaultfd), tying in the
