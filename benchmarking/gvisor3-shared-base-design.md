@@ -62,6 +62,20 @@ The chunk mmap is the easy part. Correctness needs four more things:
   MAP_PRIVATE mapping in `extendChunksLocked`; compile into runsc; unit-test the
   COW semantics of a base-backed chunk (reads see base bytes; a write is private
   and does not modify the base file).
+  STATUS: DONE (patch in `gvisor3-s1.pgalloc.patch`) -- option added, base-range
+  chunks overlaid `MAP_PRIVATE|MAP_FIXED` from the shared base file, gofmt-clean,
+  compiles into runsc. The underlying COW primitive is already proven by
+  `density_smoke.c` (same `MAP_PRIVATE`-over-shared-file syscall). Deferred to S1b:
+  the in-tree bazel unit test (needs a BUILD/gazelle entry plus a base-file harness;
+  see the granularity finding below for why the harness needs a >=1 GiB base).
+  FINDING (granularity): gVisor's `chunkSize` is 1 GiB (`chunkShift=30`), NOT the
+  LLIFS 2 MiB block. So base sharing at chunk granularity is in 1 GiB units: a
+  chunk is overlaid only when fully within `[0, SharedBaseBytes)` (the guard), so
+  `SharedBaseBytes` must be a multiple of 1 GiB and the base file >= that, and a
+  sub-1-GiB base shares nothing this way. Production GVISOR-3 should map the base
+  region with its own sub-chunk mmap (e.g. 2 MiB) decoupled from the 1 GiB chunk
+  arithmetic, so sub-GiB agents also share. (This is the cheapest place the design
+  changed once implemented.)
 - S2: produce a base memory snapshot file (MemoryFile-offset layout) from a
   checkpoint.
 - S3: restore base/delta split -- restore loads only the delta, base via the
@@ -72,5 +86,8 @@ The chunk mmap is the easy part. Correctness needs four more things:
   CAS.
 
 ## Status
-Mechanism proven, baseline measured, patch point pinned (`extendChunksLocked`,
-pgalloc.go ~889/933). S1 onward is the build.
+Mechanism proven, baseline measured, patch point pinned. S1 DONE: the shared-base
+MemoryFile option is implemented and compiles into runsc (`gvisor3-s1.pgalloc.patch`),
+with the 1 GiB chunk-granularity finding above. Next: S1b (unit test + finer
+sub-chunk base mapping for sub-GiB agents), then S2/S3 (base-file production +
+restore base/delta split) to realize the flatten through runsc.
