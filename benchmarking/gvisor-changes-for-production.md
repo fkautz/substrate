@@ -110,10 +110,23 @@ B2. [proto] Async page loader integration. The background/lazy restore page load
     full sentry), so unit tests must set MemoryFileOpts.DisableMemoryAccounting -- a
     reminder that base-vs-delta accounting (A5) lives in that same global path.
 
-B3. [needed] Verify-before-expose on base fault-in (COW-6/6a/6b). A userfaultfd
-    MISSING handler over the base region that fetches + Terrapin-verifies the 2 MiB
-    block before exposure; known-zero installs via UFFDIO_ZEROPAGE without fetch.
-    (Mechanism + ~0.9 ms/2 MiB verify cost proven in density_smoke.c / uffd_latency.)
+B3. [proto] Verify-before-expose (COW-6/6a/6b). Terrapin-verify the 2 MiB blocks of
+    the shared base before exposure; known-zero installs via UFFDIO_ZEROPAGE without
+    fetch (lazy/remote variant). PROTO (benchmarking/verify_share, real terrapin-go
+    v0.3): node-level verify-before-expose (re-hash every block vs the per-block GitOID
+    manifest) composed with the N-way MAP_PRIVATE flatten + a tamper test. Result:
+    verification does NOT change the flatten (8.0x@N=16, 15.6x@N=32, same as the
+    integrity-free sec-10 numbers); verify cost is once PER NODE and independent of N
+    (35 ms / 64 MiB, ~1.9 GB/s; MVERIFY-2 realized); a flipped byte is REJECTED at its
+    block. ARCHITECTURE FINDING: verification is NODE-level (verify the shared base
+    once, then per-sandbox MAP_PRIVATE share), NOT a per-sandbox uffd handler -- a
+    per-sandbox UFFDIO_COPY would make a PRIVATE page per faulter and defeat sharing.
+    So Terrapin verification lives ABOVE gVisor (substrate verifies, hands gVisor a
+    trusted base fd; pgalloc just maps it via B1/B2). REMAINING for production: the
+    lazy/remote variant -- a uffd MISSING handler over a NODE-SHARED backing that
+    fetches each absent block from the CAS, verifies it, and populates the shared
+    backing once per node (the sec-8 transport case); plus UFFDIO_ZEROPAGE for
+    known-zero. The verify step itself is this proto.
 
 ## C. runsc CLI / control-plane plumbing
 
