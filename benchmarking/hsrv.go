@@ -45,6 +45,41 @@ func main() {
 		return
 	}
 
+	// Load client: `hsrv load <N>` issues N health-check requests from a SINGLE
+	// process (so the delta measurement is not confounded by many transient guest
+	// client processes -- only the server's own divergence is measured).
+	if len(os.Args) > 2 && os.Args[1] == "load" {
+		nreq, _ := strconv.Atoi(os.Args[2])
+		last := ""
+		for i := 0; i < nreq; i++ {
+			resp, err := http.Get("http://127.0.0.1:" + port + "/healthz")
+			if err != nil {
+				fmt.Println("LOAD FAILED:", err)
+				os.Exit(1)
+			}
+			b, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			last = string(b)
+		}
+		fmt.Printf("load done n=%d last=%s", nreq, last)
+		return
+	}
+
+	// Control client: `hsrv dirty <MiB>` asks the server to write that many MiB
+	// of its warm heap (one byte per 4 KiB page), producing a KNOWN delta so the
+	// memfd-diff harness can be validated against ground truth.
+	if len(os.Args) > 2 && os.Args[1] == "dirty" {
+		resp, err := http.Get("http://127.0.0.1:" + port + "/dirty?mb=" + os.Args[2])
+		if err != nil {
+			fmt.Println("DIRTY FAILED:", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		fmt.Print(string(b))
+		return
+	}
+
 	mb := 512
 	if v := os.Getenv("WARM_MB"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
@@ -69,6 +104,18 @@ func main() {
 
 	var reqs int64
 	start := time.Now()
+	// /dirty?mb=N writes one byte into each of the first N*256 pages of the warm
+	// heap, dirtying exactly N MiB of resident pages (the ground-truth delta).
+	http.HandleFunc("/dirty", func(w http.ResponseWriter, r *http.Request) {
+		d, _ := strconv.Atoi(r.URL.Query().Get("mb"))
+		pages := d * 256
+		dirtied := 0
+		for p := 0; p < pages && p*4096 < n; p++ {
+			warm[p*4096]++
+			dirtied++
+		}
+		fmt.Fprintf(w, "dirtied pages=%d (%d MiB) pid=%d\n", dirtied, dirtied/256, os.Getpid())
+	})
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		ok := "ok"
 		if sample() != ref {
