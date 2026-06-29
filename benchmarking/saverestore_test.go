@@ -15,6 +15,7 @@ import (
 	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/hostarch"
 	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
+	"gvisor.dev/gvisor/pkg/state"
 )
 
 func mkMemFile(t *testing.T, opts MemoryFileOpts) *MemoryFile {
@@ -132,5 +133,107 @@ func TestSaveRestoreRoundTrip(t *testing.T) {
 				t.Fatalf("restored page %d byte %d: got %#x want %#x", p, i, dmem[p*int(pg)+i], want)
 			}
 		}
+	}
+}
+
+// TestSaveWithBaseExcludesDelta verifies A6: when a base image is supplied to
+// SaveTo, committed pages identical to the base are excluded from the pages file
+// and recorded in memoryFileSaved.baseBacked; only the delta is written.
+func TestSaveWithBaseExcludesDelta(t *testing.T) {
+	ctx := context.Background()
+	pg := uint64(hostarch.PageSize)
+	const npages, ndelta = 16, 3
+
+	src := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
+	defer src.Destroy()
+	fr, err := src.Allocate(npages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssl, err := src.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	smem := ssl.Head().ToSlice()
+	for p := 0; p < npages; p++ {
+		for i := 0; i < int(pg); i++ {
+			smem[p*int(pg)+i] = byte(p*13 + 1) // all non-zero, distinct
+		}
+	}
+
+	base, err := os.CreateTemp("", "llifs-base-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(base.Name())
+	defer base.Close()
+	bsz, err := src.ExportLinearBase(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Modify ndelta pages AFTER export -> these are the only pages that must be
+	// written when saving against the base.
+	for _, p := range []int{2, 8, 13} {
+		smem[p*int(pg)] ^= 0xFF
+	}
+
+	doSave := func(useBase bool) (uint64, []byte) {
+		tmp, err := os.CreateTemp("", "llifs-pages-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		name := tmp.Name()
+		tmp.Close()
+		defer os.Remove(name)
+		wfd, err := syscall.Open(name, syscall.O_RDWR|syscall.O_TRUNC, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		aw := stateio.NewPagesFileFDWriterDefault(int32(wfd))
+		var wg sync.WaitGroup
+		var serr error
+		wg.Add(1)
+		apfs, err := StartAsyncPagesFileSave(aw, func(e error) { serr = e; wg.Done() })
+		if err != nil {
+			t.Fatal(err)
+		}
+		so := &SaveOpts{PagesFile: apfs, ExcludeCommittedZeroPages: true}
+		if useBase {
+			so.SharedBaseFile = base
+			so.SharedBaseBytes = bsz
+		}
+		var meta bytes.Buffer
+		if err := src.SaveTo(ctx, &meta, so); err != nil {
+			t.Fatalf("SaveTo: %v", err)
+		}
+		off := apfs.PagesFileOffset()
+		apfs.MemoryFilesDone()
+		wg.Wait()
+		if serr != nil {
+			t.Fatalf("async save: %v", serr)
+		}
+		return off, meta.Bytes()
+	}
+
+	offNoBase, _ := doSave(false)
+	offBase, metaBase := doSave(true)
+
+	if offNoBase != npages*pg {
+		t.Errorf("no-base pages file: got %d bytes, want %d (%d pages)", offNoBase, npages*pg, npages)
+	}
+	if offBase != ndelta*pg {
+		t.Errorf("with-base pages file: got %d bytes, want %d (%d delta pages)", offBase, ndelta*pg, ndelta)
+	}
+
+	var mfs memoryFileSaved
+	if _, err := state.Load(ctx, bytes.NewReader(metaBase), &mfs); err != nil {
+		t.Fatalf("load metadata: %v", err)
+	}
+	var bbPages uint64
+	for st, en := range mfs.baseBacked {
+		bbPages += (en - st) / pg
+	}
+	if bbPages != npages-ndelta {
+		t.Errorf("baseBacked pages: got %d, want %d", bbPages, npages-ndelta)
 	}
 }

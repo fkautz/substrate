@@ -1,8 +1,8 @@
 diff --git a/pkg/sentry/pgalloc/BUILD b/pkg/sentry/pgalloc/BUILD
-index 32f5a76..5fdf3f5 100644
+index 32f5a76..bf09385 100644
 --- a/pkg/sentry/pgalloc/BUILD
 +++ b/pkg/sentry/pgalloc/BUILD
-@@ -207,10 +207,14 @@ go_test(
+@@ -207,10 +207,15 @@ go_test(
      srcs = [
          "pgalloc_64k_test.go",
          "pgalloc_test.go",
@@ -15,6 +15,7 @@ index 32f5a76..5fdf3f5 100644
          "//pkg/hostarch",
          "//pkg/sentry/memmap",
 +        "//pkg/sentry/state/stateio",
++        "//pkg/state",
      ],
  )
 diff --git a/pkg/sentry/pgalloc/pgalloc.go b/pkg/sentry/pgalloc/pgalloc.go
@@ -182,3 +183,151 @@ index 43d9c4d..2ca3852 100644
  func (f *MemoryFile) madviseChunkMapping(addr, len uintptr, huge bool) {
  	if huge {
  		if f.opts.AdviseHugepage {
+diff --git a/pkg/sentry/pgalloc/save_restore.go b/pkg/sentry/pgalloc/save_restore.go
+index 163ee5f..f4986fe 100644
+--- a/pkg/sentry/pgalloc/save_restore.go
++++ b/pkg/sentry/pgalloc/save_restore.go
+@@ -20,6 +20,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"math"
++	"os"
+ 	"runtime"
+ 	"sync/atomic"
+ 	"time"
+@@ -74,6 +75,11 @@ type memoryFileSaved struct {
+ 	subreleased  map[uint64]uint64
+ 	memAcct      *memAcctSet
+ 	chunks       []chunkInfo
++	// baseBacked records the page ranges (start->end) whose contents were
++	// identical to the shared base at save time and were therefore excluded
++	// from the pages file (GVISOR-3 A6); on restore they are served by the
++	// base mapping rather than reloaded. Empty/nil for base-less saves.
++	baseBacked map[uint64]uint64
+ }
+ 
+ // SaveOpts provides options to MemoryFile.SaveTo().
+@@ -93,6 +99,14 @@ type SaveOpts struct {
+ 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
+ 	// size, if the application has many committed zero pages.
+ 	ExcludeCommittedZeroPages bool
++
++	// SharedBaseFile, if non-nil, is a read-only base image (in MemoryFile-offset
++	// layout, e.g. from ExportLinearBase) covering [0, SharedBaseBytes). Committed
++	// pages whose contents are identical to the base are EXCLUDED from the pages
++	// file (GVISOR-3 A6) and recorded in memoryFileSaved.baseBacked; on restore
++	// they are served by the shared base mapping rather than reloaded.
++	SharedBaseFile  *os.File
++	SharedBaseBytes uint64
+ }
+ 
+ // SaveTo writes f's state to the given stream.
+@@ -172,6 +186,20 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		}
+ 	}
+ 
++	// GVISOR-3 (A6): base-aware delta exclusion. When a base image is provided,
++	// committed pages whose contents equal the base are excluded from the pages
++	// file and recorded in baseBacked (start->end). recordBaseBacked receives a
++	// maximal contiguous base-backed run (the scan coalesces by page state).
++	baseFile := opts.SharedBaseFile
++	baseBytes := opts.SharedBaseBytes
++	baseBuf := make([]byte, hostarch.PageSize)
++	baseBacked := make(map[uint64]uint64)
++	recordBaseBacked := func(fr memmap.FileRange) {
++		if fr.Length() != 0 {
++			baseBacked[fr.Start] = fr.End
++		}
++	}
++
+ 	// Reading an uncommitted page to determine if it is zero-filled will cause
+ 	// it to become committed. Thus, we need to decommit zero-filled pages that
+ 	// were not previously known to be committed to avoid increasing memory
+@@ -227,8 +255,9 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		updatePendingFR           memmap.FileRange
+ 		updatePendingWasCommitted bool
+ 		updatePendingNowCommitted bool
++		updatePendingNowBase      bool
+ 	)
+-	updateNow := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted bool) memAcctIterator {
++	updateNow := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted, nowBase bool) memAcctIterator {
+ 		amount := fr.Length()
+ 		if amount == 0 {
+ 			return maseg
+@@ -254,19 +283,23 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 			maseg = f.memAcct.Unisolate(maseg)
+ 		}
+ 		if nowCommitted {
+-			asyncWritePages(fr)
++			if nowBase {
++				recordBaseBacked(fr)
++			} else {
++				asyncWritePages(fr)
++			}
+ 		}
+ 		return maseg
+ 	}
+ 	// Precondition: maseg.Range().IsSupersetOf(fr).
+ 	// Postcondition: The returned memAcctIterator.Range().IsSupersetOf(fr).
+-	updateAddRange := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted bool) memAcctIterator {
+-		if updatePendingFR.End == fr.Start && updatePendingWasCommitted == wasCommitted && updatePendingNowCommitted == nowCommitted {
++	updateAddRange := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted, nowBase bool) memAcctIterator {
++		if updatePendingFR.End == fr.Start && updatePendingWasCommitted == wasCommitted && updatePendingNowCommitted == nowCommitted && updatePendingNowBase == nowBase {
+ 			updatePendingFR.End = fr.End
+ 			return maseg
+ 		}
+ 		if updatePendingFR.Length() != 0 {
+-			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted)
++			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted, updatePendingNowBase)
+ 			if maseg.End() == fr.Start {
+ 				maseg = maseg.NextSegment()
+ 			}
+@@ -274,11 +307,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		updatePendingFR = fr
+ 		updatePendingWasCommitted = wasCommitted
+ 		updatePendingNowCommitted = nowCommitted
++		updatePendingNowBase = nowBase
+ 		return maseg
+ 	}
+ 	updateFlush := func(maseg memAcctIterator) memAcctIterator {
+ 		if updatePendingFR.Length() != 0 {
+-			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted)
++			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted, updatePendingNowBase)
+ 		}
+ 		updatePendingFR = memmap.FileRange{}
+ 		return maseg
+@@ -315,9 +349,9 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		allocatedBytes += fr.Length()
+ 		ma.commitSeq = 0
+ 		wasCommitted := ma.knownCommitted
+-		if !opts.ExcludeCommittedZeroPages && wasCommitted {
++		if !opts.ExcludeCommittedZeroPages && wasCommitted && baseFile == nil {
+ 			alreadyCommittedBytes += fr.Length()
+-			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */)
++			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */, false /* nowBase */)
+ 			maseg = updateFlush(maseg)
+ 			if maseg.End() == unscannedStart {
+ 				maseg = maseg.NextSegment()
+@@ -344,7 +378,13 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 						alreadyCommittedBytes += hostarch.PageSize
+ 					}
+ 				}
+-				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed)
++				isBase := false
++				if !isZeroed && baseFile != nil && off+hostarch.PageSize <= baseBytes {
++					if _, rerr := baseFile.ReadAt(baseBuf, int64(off)); rerr == nil {
++						isBase = bytes.Equal(pg, baseBuf)
++					}
++				}
++				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed, isBase)
+ 			}
+ 			// f.UpdateUsage() may be called concurrently with f.SaveTo();
+ 			// occasionally unlock f.mu to ensure that the former can promptly
+@@ -394,6 +434,7 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		subreleased:  f.subreleased,
+ 		memAcct:      &f.memAcct,
+ 		chunks:       f.chunksLoad(),
++		baseBacked:   baseBacked,
+ 	}); err != nil {
+ 		return fmt.Errorf("failed to save metadata: %w", err)
+ 	}

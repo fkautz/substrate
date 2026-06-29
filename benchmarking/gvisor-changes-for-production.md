@@ -41,9 +41,25 @@ A5. [needed] Memory accounting. Resident base pages should be accounted as share
     delta (COW-dirty pages) is what counts per agent. `memAcct` / usage reporting
     must distinguish base vs delta.
 
-A6. [needed] Save (checkpoint). The save path (save_restore.go) must EXCLUDE
+A6. [proto] Save (checkpoint). The save path (save_restore.go) must EXCLUDE
     base-range pages from the saved image (they are the shared base, not per-agent
     state) and save only the per-agent delta (COW-dirty / non-base pages).
+    DONE (proto): SaveOpts gains SharedBaseFile + SharedBaseBytes; SaveTo's scan
+    threads a third page state `nowBase` (alongside wasCommitted/nowCommitted)
+    through updateAddRange/updateNow so base-identical committed pages coalesce
+    separately and are sent to recordBaseBacked (no pages-file write) instead of
+    asyncWritePages; the base-backed set is stored in memoryFileSaved.baseBacked
+    (map[uint64]uint64 start->end, mirrors subreleased; stateify autogen regenerates
+    it automatically -- the *_state_autogen.go are bazel-generated, not checked in).
+    The base-vs-page compare is folded INTO the existing per-page scan (which already
+    reads each page for the zero test), so no extra pass; against base==nil the
+    fast-path and behavior are unchanged. Verified by TestSaveWithBaseExcludesDelta:
+    16 committed pages, modify 3 after export -> no-base save writes 16 pages,
+    with-base save writes 3 (delta) and records 13 base-backed. Production: compare
+    against the mmapped base rather than Pread per page; force the scan path when a
+    base is set (currently guarded by baseFile==nil on the !ExcludeCommittedZeroPages
+    fast path). The standalone BaseBackedRanges (F5) remains the tested reference for
+    the same predicate.
 
 ## B. Restore path (pkg/sentry/pgalloc/save_restore.go + runsc)
 
@@ -160,6 +176,20 @@ F5. [found][proto] Delta computation. gVisor checkpoints ABSOLUTE state, not
     each page to test for zero) rather than a separate full re-read, and compare
     against the mmapped base rather than Pread per page.
 
+F8. [found] LoadFrom bypasses the extendChunksLocked base overlay (shapes B1/B2
+    load). On restore, LoadFrom does its OWN single mmap of f.file (MAP_SHARED over
+    the whole fileSize, save_restore.go ~967) and assigns chunk.mapping from it --
+    it does NOT call extendChunksLocked, so the S1/S1b SharedBaseFile overlay is not
+    applied on the restore path. Moreover the async page loader writes delta content
+    to the memfd FD (RegisterDestinationFD(f.file.Fd())), not through the mapping.
+    CONSEQUENCE for the load side: to share the base on restore, LoadFrom must itself
+    overlay [0,baseBytes) MAP_PRIVATE from the base (the S1 mmap, applied to its own
+    mapping), skip the baseBacked set from page loading (the mapping supplies that
+    content), and apply base-range DELTA pages by writing them OVER the mapping (COW,
+    the S3/F4 mechanism) rather than via the memfd FD -- since the MAP_PRIVATE region
+    is decoupled from f.file. Pages at/after baseBytes load normally via the FD. This
+    makes the load side a distinct, larger piece than the save side.
+
 F7. [found] Save/load symmetry constraint (grounds B1/B2). SaveTo walks f.memAcct
     segments and appends each committed non-zero page to the pages file in WALK
     ORDER via asyncWritePages (saveOff bumps by length) -- the pages file is PACKED,
@@ -196,6 +226,8 @@ Revised S2/S3 (grounded by F1-F5):
   - TestSaveRestoreRoundTrip: drives the real SaveTo->LoadFrom path (packed pages
     file via stateio + stateify metadata) and restores 16 pages incl. a zero page
     byte-for-byte -- the harness for the A6/B1/B2 base-backed-skip work.
+  - TestSaveWithBaseExcludesDelta: save-side A6 -- with a base, SaveTo writes only
+    the 3 delta pages (vs 16 without) and records 13 base-backed in metadata.
 - MECHANISM uncertainty for GVISOR-3 is now retired (map-base + export-base +
   apply-delta-over-base + delta-computation all proven in-tree).
 - Remaining is INTEGRATION, not mechanism: B1/B2 (wire the apply path into runsc's
