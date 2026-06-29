@@ -85,8 +85,22 @@ B1. [proto] Base/delta split (the big one, S3). Restore must consume (base-file 
     page loader (B2) to apply base-range delta through the mapping (COW) instead of
     the memfd FD, since runsc uses the async FD path. See F8.
 
-B2. [needed] Async page loader integration. The background/lazy restore page loader
+B2. [proto] Async page loader integration. The background/lazy restore page loader
     must skip the base range and operate only on the delta.
+    DONE (proto): the async LoadFrom branch now inserts only deltaSubRanges into the
+    loader''s `unloaded` set (skipping base-backed pages, symmetric with save) and
+    advances PagesFileOffset by delta lengths only; the sync-only guard is removed so
+    base + async PagesFile is supported. KEY CORRECTION TO F8: the FDReader does NOT
+    write to the memfd FD -- it embeds NoRegisterClientFD (NeedRegisterDestinationFD
+    false, so df is nil) and reads the pages file straight INTO THE MAPPING MEMORY
+    via aio.Read/Readv on the iovecs built from forEachMappingSlice(chunk.mapping).
+    Since LoadFrom applies the MAP_PRIVATE base overlay BEFORE the loader builds those
+    iovecs, the async read COWs the base overlay for base-range delta and writes
+    through the shared region beyond it -- no async-loader rewrite was needed. Verified
+    by TestRestoreOverBaseAsync (the runsc-style async FD pages file + base overlay:
+    base-backed pages from the overlay, delta COW-applied, base file unmodified, pages
+    file holds only the 3 delta pages). Packed-stream offsets stay aligned because both
+    save and load traverse the same delta bytes in ascending order (F7).
     HARNESS DONE: TestSaveRestoreRoundTrip drives the REAL SaveTo->LoadFrom path
     end-to-end in-tree (packed pages file via stateio FD writer/reader + stateify
     metadata over a bytes.Buffer; nil timeline; context.Background), restoring 16
@@ -186,19 +200,20 @@ F5. [found][proto] Delta computation. gVisor checkpoints ABSOLUTE state, not
     each page to test for zero) rather than a separate full re-read, and compare
     against the mmapped base rather than Pread per page.
 
-F8. [found] LoadFrom bypasses the extendChunksLocked base overlay (shapes B1/B2
-    load). On restore, LoadFrom does its OWN single mmap of f.file (MAP_SHARED over
-    the whole fileSize, save_restore.go ~967) and assigns chunk.mapping from it --
-    it does NOT call extendChunksLocked, so the S1/S1b SharedBaseFile overlay is not
-    applied on the restore path. Moreover the async page loader writes delta content
-    to the memfd FD (RegisterDestinationFD(f.file.Fd())), not through the mapping.
-    CONSEQUENCE for the load side: to share the base on restore, LoadFrom must itself
-    overlay [0,baseBytes) MAP_PRIVATE from the base (the S1 mmap, applied to its own
-    mapping), skip the baseBacked set from page loading (the mapping supplies that
-    content), and apply base-range DELTA pages by writing them OVER the mapping (COW,
-    the S3/F4 mechanism) rather than via the memfd FD -- since the MAP_PRIVATE region
-    is decoupled from f.file. Pages at/after baseBytes load normally via the FD. This
-    makes the load side a distinct, larger piece than the save side.
+F8. [found][CORRECTED] LoadFrom bypasses the extendChunksLocked base overlay. On
+    restore, LoadFrom does its OWN single mmap of f.file (MAP_SHARED over the whole
+    fileSize, save_restore.go ~967) and assigns chunk.mapping from it -- it does NOT
+    call extendChunksLocked, so the load side must apply the [0,baseBytes) MAP_PRIVATE
+    base overlay itself (done in LoadFrom, B1). CORRECTION: the original worry that the
+    async loader "writes delta to the memfd FD" was WRONG. The pages-file FDReader
+    embeds NoRegisterClientFD -> NeedRegisterDestinationFD is false -> the DestinationFile
+    is nil and AddRead/AddReadv read the pages file directly INTO THE MAPPING MEMORY
+    (aio.Read/Readv over the iovecs from forEachMappingSlice(chunk.mapping)). Because
+    the overlay is established before the loader builds those iovecs, async delta reads
+    COW the base overlay automatically -- so BOTH the sync and async paths apply
+    base-range delta through the mapping, and no async-loader rewrite was required
+    (B2 was a small skip-the-base-backed-set change). Pages at/after baseBytes are in
+    the MAP_SHARED region and write through to f.file as before.
 
 F7. [found] Save/load symmetry constraint (grounds B1/B2). SaveTo walks f.memAcct
     segments and appends each committed non-zero page to the pages file in WALK
@@ -242,6 +257,9 @@ Revised S2/S3 (grounded by F1-F5):
     restore with the base overlaid MAP_PRIVATE; base-backed pages read base content
     (from the overlay), delta pages read delta content (COW over the mapping), base
     file unmodified. The full base/delta save->restore split, end to end (sync path).
+  - TestRestoreOverBaseAsync: B2 -- the same, via the runsc-style ASYNC FD pages file;
+    the async loader reads delta into the overlaid mapping (COW). Pages file holds only
+    the 3 delta pages; base-backed from overlay, delta COW-applied, base unmodified.
 - MECHANISM uncertainty for GVISOR-3 is now retired (map-base + export-base +
   apply-delta-over-base + delta-computation all proven in-tree).
 - Remaining is INTEGRATION, not mechanism: B1/B2 (wire the apply path into runsc's

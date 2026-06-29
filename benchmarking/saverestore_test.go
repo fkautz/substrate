@@ -325,3 +325,135 @@ func TestRestoreOverBase(t *testing.T) {
 		}
 	}
 }
+
+// TestRestoreOverBaseAsync is TestRestoreOverBase via the ASYNC pages-file path
+// (what runsc uses): save against a base writing only the delta to an stateio FD
+// pages file, then restore with that pages file AND the base overlaid. Proves B2 --
+// the async loader reads delta into the (overlaid) mapping, COWing base-range pages.
+func TestRestoreOverBaseAsync(t *testing.T) {
+	ctx := context.Background()
+	pg := uint64(hostarch.PageSize)
+	const npages = 16
+	deltaPages := map[int]byte{2: 0x22, 8: 0x88, 13: 0xDD}
+	baseVal := func(p int) byte { return byte(p*13 + 1) }
+
+	src := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
+	defer src.Destroy()
+	fr, err := src.Allocate(npages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssl, err := src.MapInternal(fr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	smem := ssl.Head().ToSlice()
+	for p := 0; p < npages; p++ {
+		for i := 0; i < int(pg); i++ {
+			smem[p*int(pg)+i] = baseVal(p)
+		}
+	}
+	base, err := os.CreateTemp("", "llifs-base-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(base.Name())
+	defer base.Close()
+	bsz, err := src.ExportLinearBase(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for p, v := range deltaPages {
+		for i := 0; i < int(pg); i++ {
+			smem[p*int(pg)+i] = v
+		}
+	}
+
+	tmp, err := os.CreateTemp("", "llifs-pages-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pfName := tmp.Name()
+	tmp.Close()
+	defer os.Remove(pfName)
+
+	// SAVE (async pages file) against the base.
+	wfd, err := syscall.Open(pfName, syscall.O_RDWR|syscall.O_TRUNC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aw := stateio.NewPagesFileFDWriterDefault(int32(wfd))
+	var swg sync.WaitGroup
+	var serr error
+	swg.Add(1)
+	apfs, err := StartAsyncPagesFileSave(aw, func(e error) { serr = e; swg.Done() })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var meta bytes.Buffer
+	if err := src.SaveTo(ctx, &meta, &SaveOpts{PagesFile: apfs, ExcludeCommittedZeroPages: true, SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	deltaBytes := apfs.PagesFileOffset()
+	apfs.MemoryFilesDone()
+	swg.Wait()
+	if serr != nil {
+		t.Fatalf("async save: %v", serr)
+	}
+	if deltaBytes != uint64(len(deltaPages))*pg {
+		t.Fatalf("pages file: got %d bytes, want %d (delta only)", deltaBytes, uint64(len(deltaPages))*pg)
+	}
+
+	// RESTORE (async pages file) with the base overlaid.
+	rfd, err := syscall.Open(pfName, syscall.O_RDONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ar := stateio.NewPagesFileFDReaderDefault(int32(rfd))
+	var lwg sync.WaitGroup
+	var lerr error
+	lwg.Add(1)
+	apfl, err := StartAsyncPagesFileLoad(ar, func(e error) { lerr = e; lwg.Done() }, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dst := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
+	defer dst.Destroy()
+	if err := dst.LoadFrom(ctx, bytes.NewReader(meta.Bytes()), &LoadOpts{PagesFile: apfl, SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
+		t.Fatalf("LoadFrom: %v", err)
+	}
+	apfl.MemoryFilesDone()
+	if err := dst.AwaitLoadAll(); err != nil {
+		t.Fatalf("AwaitLoadAll: %v", err)
+	}
+	lwg.Wait()
+	if lerr != nil {
+		t.Fatalf("async load: %v", lerr)
+	}
+
+	dsl, err := dst.MapInternal(fr, hostarch.Read)
+	if err != nil {
+		t.Fatalf("dst MapInternal: %v", err)
+	}
+	dmem := dsl.Head().ToSlice()
+	for p := 0; p < npages; p++ {
+		want := baseVal(p)
+		if v, ok := deltaPages[p]; ok {
+			want = v
+		}
+		for i := 0; i < int(pg); i++ {
+			if got := dmem[p*int(pg)+i]; got != want {
+				t.Fatalf("restored page %d byte %d: got %#x want %#x", p, i, got, want)
+			}
+		}
+	}
+	chk := make([]byte, 1)
+	for p := range deltaPages {
+		if _, err := base.ReadAt(chk, int64(fr.Start)+int64(uint64(p)*pg)); err != nil {
+			t.Fatal(err)
+		}
+		if chk[0] != baseVal(p) {
+			t.Fatalf("base file mutated at page %d", p)
+		}
+	}
+}

@@ -184,7 +184,7 @@ index 43d9c4d..2ca3852 100644
  	if huge {
  		if f.opts.AdviseHugepage {
 diff --git a/pkg/sentry/pgalloc/save_restore.go b/pkg/sentry/pgalloc/save_restore.go
-index 163ee5f..19acf4a 100644
+index 163ee5f..d9fb049 100644
 --- a/pkg/sentry/pgalloc/save_restore.go
 +++ b/pkg/sentry/pgalloc/save_restore.go
 @@ -20,7 +20,9 @@ import (
@@ -393,7 +393,7 @@ index 163ee5f..19acf4a 100644
  }
  
  // LoadFrom loads MemoryFile state from the given stream.
-@@ -947,6 +999,15 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
+@@ -947,6 +999,12 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
  	f.memAcct.MoveFrom(mfs.memAcct)
  	chunks := mfs.chunks
  	f.chunks.Store(&chunks)
@@ -403,13 +403,10 @@ index 163ee5f..19acf4a 100644
 +	if len(mfs.baseBacked) != 0 && opts.SharedBaseFile == nil {
 +		return fmt.Errorf("checkpoint has %d base-backed ranges but no SharedBaseFile was provided", len(mfs.baseBacked))
 +	}
-+	if opts.SharedBaseFile != nil && opts.PagesFile != nil {
-+		return fmt.Errorf("base-backed restore requires a synchronous pages file (LoadOpts.PagesFile must be nil) in this prototype")
-+	}
  	mfTimeline.Reached("metadata loaded")
  	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
  
-@@ -973,11 +1034,31 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
+@@ -973,11 +1031,31 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
  			return fmt.Errorf("failed to mmap MemoryFile: %w", errno)
  		}
  		mfTimeline.Reached("mmaped chunks")
@@ -441,9 +438,39 @@ index 163ee5f..19acf4a 100644
  		madviseWG.Add(1)
  		go func() {
  			defer madviseWG.Done()
-@@ -1075,29 +1156,29 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
- 			opts.PagesFileOffset += amount
- 			amfl.pf.lfStatus.Notify(aplLFPending)
+@@ -1062,42 +1140,48 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
+ 			<-madviseChan
+ 		}
+ 		if amfl != nil {
+-			// Record where to read data.
+-			if !minUnloadedInit {
+-				minUnloadedInit = true
+-				amfl.minUnloaded.Store(maFR.Start)
++			// Record where to read data for each delta sub-range; base-backed
++			// pages are served by the MAP_PRIVATE base overlay (GVISOR-3 B1/B2)
++			// and are absent from the pages file, so skip them symmetrically with
++			// save. The async loader reads each range into the mapping memory,
++			// COWing the base overlay for base-range delta pages.
++			for _, dfr := range deltaSubRanges(maFR, baseBackedList) {
++				if !minUnloadedInit {
++					minUnloadedInit = true
++					amfl.minUnloaded.Store(dfr.Start)
++				}
++				amfl.pf.mu.Lock()
++				amfl.unloaded.InsertRange(dfr, aplUnloadedInfo{
++					off: opts.PagesFileOffset,
++				})
++				amfl.pf.mu.Unlock()
++				opts.PagesFileOffset += dfr.Length()
++				amfl.pf.lfStatus.Notify(aplLFPending)
+ 			}
+-			amfl.pf.mu.Lock()
+-			amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
+-				off: opts.PagesFileOffset,
+-			})
+-			amfl.pf.mu.Unlock()
+-			opts.PagesFileOffset += amount
+-			amfl.pf.lfStatus.Notify(aplLFPending)
  		} else {
 -			// Verify header.
 -			length, object, err := state.ReadHeader(&wr)
@@ -492,7 +519,7 @@ index 163ee5f..19acf4a 100644
  			}
  		}
  
-@@ -2009,3 +2090,47 @@ func (f *MemoryFile) getClientFileRangeSettings(fileSize uint64) []stateio.Clien
+@@ -2009,3 +2093,47 @@ func (f *MemoryFile) getClientFileRangeSettings(fileSize uint64) []stateio.Clien
  	})
  	return cfrs
  }

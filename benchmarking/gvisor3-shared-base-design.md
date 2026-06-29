@@ -122,10 +122,17 @@ The chunk mmap is the easy part. Correctness needs four more things:
   applies delta through the mapping (COW for the private base range; write-through
   beyond baseBytes). Verified by TestRestoreOverBase: the full save->restore base/
   delta split end to end -- base-backed pages read base content from the overlay,
-  delta pages read delta content, base file unmodified. This uses the SYNCHRONOUS
-  pages path; productionizing means teaching the ASYNC loader (which runsc uses) to
-  apply base-range delta through the mapping instead of the memfd FD (F8) -- that is
-  the remaining wiring before S4 (the N-clone runsc flatten measurement).
+  delta pages read delta content, base file unmodified. Fifth piece done: the ASYNC
+  path (B2), which is what runsc uses. The worry that the async loader writes to the
+  memfd FD (F8) was WRONG: the pages-file FDReader reads straight into the mapping
+  memory (iovecs from forEachMappingSlice), so with the overlay in place the async
+  delta reads COW the base automatically. B2 was just making the async branch skip the
+  base-backed set (deltaSubRanges) and dropping the sync-only guard. Verified by
+  TestRestoreOverBaseAsync. So the GVISOR-3 base/delta mechanism is now PROVEN on both
+  the sync and async (production) pgalloc paths. Remaining before a runsc-observable
+  flatten: base-aware bookkeeping (A4/A5 decommit/accounting), runsc CLI plumbing to
+  pass the base image + State Root (C1), and then S4 (the N-clone flatten measurement
+  vs the 1674 MiB baseline); B3 verify-before-expose layers on after.
 - S4: N-clone runsc test measuring the flatten (expect ~1 x base + N x delta,
   vs the measured 1674 MiB baseline).
 - S5: Terrapin verify-before-expose on base fault-in (userfaultfd), tying in the
