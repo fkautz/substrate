@@ -56,7 +56,93 @@ The gap is pluggability: `NewMemoryFile` takes one file and maps `MAP_SHARED`; t
 is no hook to back a sub-range from a shared base fd `MAP_PRIVATE`. That hook is the
 net-new capability the spec calls GVISOR-3.
 
-## 4. Status / next
+## 4. Real-workload checkpoint/restore + baseline density gap (`cr_workload.c`)
+
+A static "warmed" workload (1 GiB heap filled with a checksummed pattern, a tick
+counter incremented every second) run under runsc as an OCI bundle, then
+`runsc checkpoint` / `runsc restore`:
+
+```
+wl1 before checkpoint:  tick=8  checksum=ok
+checkpoint:             0.84 s, image 1.1 GiB
+wl1r after restore:     tick=9, 10, 11 ... checksum=ok   <- CONTINUES, not reset
+```
+
+Proves a real, non-cooperating, stateful GiB-scale workload checkpoint/restores
+correctly: live memory AND execution state survive (the counter resumes from the
+checkpoint value, the 1 GiB pattern still verifies). This validates the
+runtime-state / delta concept on gVisor's native C/R.
+
+Baseline density gap (the "before" that GVISOR-3 flattens): three clones restored
+from the SAME 1.1 GiB checkpoint each run independently (checksum=ok) and each
+materializes its OWN full copy:
+
+```
+3 sandboxes: sentry rss 1064 + 1066 + 1065 MiB = 3196 MiB total (~N x base)
+```
+
+So today N restores cost ~N x base RAM with no sharing. The section-1 smoke test
+shows the achievable end state (8 sharers over a 256 MiB base => pss ~ base/8, i.e.
+~1 x base). The GVISOR-3 MemoryFile patch is exactly the bridge between these two
+measured endpoints. (One checkpoint -> N independent restored clones also
+demonstrates the fan-out shape used by fork, §6.3.)
+
+## 5. HTTP-server clone demo (`hsrv.go`)
+
+A static Go HTTP workload (512 MiB warm heap + checksum; `/healthz` reports an
+in-memory request counter, checksum, uptime, pid) run under runsc, then
+checkpointed and restored into multiple clones. Health checks are issued by an
+in-sandbox client over netstack loopback (`runsc exec <id> /hsrv check`), which
+avoids host CNI plumbing while still exercising a real TCP/HTTP exchange and the
+network-state restore path.
+
+```
+c1 health x3:        reqs=1, reqs=2, reqs=3   checksum=ok   (stateful server)
+checkpoint:          0.39 s, 515 MiB
+3 clones from 1 checkpoint, health-checked:
+  round 1:  h_a reqs=4  h_b reqs=4  h_c reqs=4   checksum=ok  uptime=11s
+  round 2:  h_a reqs=5  h_b reqs=5  h_c reqs=5
+memory:    3 clones x ~557 MiB sentry rss = 1674 MiB total (~N x base)
+```
+
+Proves: (1) the server listens and answers HTTP health checks; (2) restore
+preserves live state -- the request counter CONTINUES from the checkpointed value
+(3 -> 4), not reset, and the 512 MiB heap still verifies; (3) clones are
+INDEPENDENT (each counter increments separately, 4 -> 5); (4) the same per-clone
+memory baseline holds for a real networked Go service. Networking note: the
+host->netstack ingress path needs CNI-style veth ownership (gVisor netstack must
+own the interface IP, or the in-netns kernel RSTs the connection); deferred as
+orthogonal to the C/R density work -- in-sandbox loopback was used instead.
+
+## 6. RHAZARD clone-divergence (`rhz.go`)
+
+Checkpoint one instance, restore 3 clones, probe FRESH samples from each source.
+A field IDENTICAL across clones is shared frozen state (a hazard); DIFFERENT means
+gVisor already refreshes it.
+
+```
+source                 across clones    verdict
+getrandom (kernel)     all different    SAFE  (gVisor gives fresh kernel entropy)
+/dev/urandom           all different    SAFE
+monotonic + wall clock advance normally SAFE  (not frozen/zeroed)
+userspace PRNG         IDENTICAL        HAZARD (math/rand state cloned -> same seq)
+boot_id                IDENTICAL        HAZARD (cloned boot identity)
+ASLR / heap address    IDENTICAL        WEAKENING (same layout in every clone)
+/proc/.../uuid         ERR              gVisor unimplemented (minor)
+```
+
+Conclusion: the fan-out-clone model is entropy-safe for KERNEL randomness and
+clocks (gVisor refreshes getrandom / urandom; clocks advance), but userspace PRNG
+state, boot_id, and ASLR are CLONED. The substrate cannot transparently fix a
+userspace PRNG or re-randomize a running process without cooperation, so the
+RHAZARD policy is: kernel-CSPRNG randomness is safe to clone; userspace
+PRNG/boot_id require a reseed hook (RHAZARD-1, cooperative) OR a policy that
+RNG-sensitive agents use getrandom OR restore-fresh (RESET) instead of clone; ASLR
+uniformity across a clone set is a residual mitigated only by trust/cache-domain
+boundaries (RHAZARD-7). This sharpens the non-cooperative tenet: clone-safety is
+conditional on the randomness source.
+
+## 7. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
 - [x] density primitives proven (section 1)
@@ -84,6 +170,8 @@ bazel is fetched via bazelisk (`bazelisk-linux-arm64`); the repo pins bazel 8.3.
 `bazel build --jobs=2 --local_resources=memory=5000 //runsc:runsc`.
 A transient `proxy.golang.org` TLS timeout during dep fetch is retryable (bazel
 caches successful fetches).
+- [x] real-workload checkpoint/restore proven (1 GiB warmed workload resumes with
+      live state intact) and baseline measured (3 clones = 3196 MiB, ~N x base)
 - [ ] implement the GVISOR-3 MAP_PRIVATE-base hook in pgalloc
 - [ ] wire a CAS-backed base fd + userfaultfd populate; run the §16.1 N-sandbox
       acceptance test through runsc
