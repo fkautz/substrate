@@ -89,17 +89,33 @@ The chunk mmap is the easy part. Correctness needs four more things:
   map base MAP_PRIVATE then WRITE delta pages over it (kernel COWs each) (F4); the
   delta must be computed (diff-vs-base or dirty-tracking) since gVisor checkpoints
   absolute state (F5). (See ledger F1-F5.)
+  STATUS: S3 restore-APPLY MECHANISM DONE (proto): TestBasePlusDeltaRestore proves
+  the F4 path in-tree -- clone A maps the shared base, applies a delta (writes
+  page1 over the base mapping -> COW) and reads base+delta (page0 base 0xAA,
+  page1 delta 0xCC); the base FILE stays 0xBB; clone B (no delta) reads pure base.
+  So map-base-then-write-delta-over-it produces the correct merged view with
+  isolation and an immutable shared base. REMAINING (production, not mechanism):
+  wire this into runsc's restore flow (LoadFrom must SKIP the base range and load
+  only delta pages -- B1/B2/F3), compute the delta at save time (F5/A6), and make
+  MemoryFile bookkeeping base-aware for decommit/accounting (A4/A5). The mechanism
+  uncertainty is now retired; what is left is integration/plumbing.
 - S4: N-clone runsc test measuring the flatten (expect ~1 x base + N x delta,
   vs the measured 1674 MiB baseline).
 - S5: Terrapin verify-before-expose on base fault-in (userfaultfd), tying in the
   CAS.
 
 ## Status
-Mechanism proven, baseline measured, patch point pinned. S1 + S1b + S2 DONE: the
-shared-base MemoryFile option (finer sub-chunk mapping) AND base export
-(ExportLinearBase) are implemented, compile into runsc, and pass in-tree bazel tests
+Mechanism proven, baseline measured, patch point pinned. S1 + S1b + S2 DONE, and the
+S3 restore-APPLY mechanism is now proven in-tree too. All three building blocks --
+shared-base MemoryFile option (finer sub-chunk mapping), base export
+(ExportLinearBase), and base+delta apply (map base + write delta over it -> COW) --
+are implemented, compile into runsc, and pass in-tree bazel tests
 (`gvisor3-s1.pgalloc.patch`, `sharedbase_test.go`: TestSharedBaseCOW +
-TestExportLinearBaseAndShare). Next: S3 (restore base/delta split: load only the
-delta, map the base, base-aware bookkeeping) -- the heaviest piece, wired into
-runsc's restore + the F5 delta computation, which is what makes real runsc clones
-share. Full gVisor production backlog tracked in `gvisor-changes-for-production.md`.
+TestExportLinearBaseAndShare + TestBasePlusDeltaRestore). The GVISOR-3 MECHANISM
+uncertainty is retired. What remains is INTEGRATION, not mechanism: wire the apply
+path into runsc's restore (LoadFrom skips the base range, loads only the delta --
+B1/B2), compute the per-agent delta at save time (F5/A6), and make MemoryFile
+bookkeeping base-aware for decommit/accounting (A4/A5). Then S4 (N-clone runsc
+flatten measurement, expect ~1 x base + N x delta vs the measured 1674 MiB baseline)
+and S5 (Terrapin verify-before-expose on base fault-in). Full gVisor production
+backlog tracked in `gvisor-changes-for-production.md`.

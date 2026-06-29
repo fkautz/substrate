@@ -111,11 +111,15 @@ F2. [found] The metadata is gVisor `state.Save(memoryFileSaved{unwaste/unfree se
 F3. [found] Restore `LoadFrom` / `AsyncPagesFileLoad` loads ALL committed pages into
     the per-sandbox memfd (awaitLoad over [0,max)). S3 must instead load only the
     delta and back the base via the shared MAP_PRIVATE mapping.
-F4. [found] Elegant restore path from S1: map the base region MAP_PRIVATE (S1/S1b),
-    then WRITE the delta pages over that mapping -> kernel COWs each written page to
-    a private copy; unwritten pages stay shared. No f.file backing of the base range
-    is needed for restore. (Bookkeeping A4/A5/A6 still must treat base-range pages
-    as shared/clean.)
+F4. [found][proto] Elegant restore path from S1: map the base region MAP_PRIVATE
+    (S1/S1b), then WRITE the delta pages over that mapping -> kernel COWs each
+    written page to a private copy; unwritten pages stay shared. No f.file backing
+    of the base range is needed for restore. PROVEN in-tree by TestBasePlusDeltaRestore:
+    clone A maps the base, writes a delta page over it (COW) and reads base+delta
+    (base page 0xAA + delta page 0xCC); the base FILE stays 0xBB; clone B (no delta)
+    reads pure base -- merged view + isolation + immutable shared base. (Bookkeeping
+    A4/A5/A6 still must treat base-range pages as shared/clean; this proto proves the
+    apply MECHANISM only, not the runsc restore plumbing B1/B2 or delta source F5.)
 F6. [found] The LIVE memfd is offset-linear: chunk i is mapped from f.file at file
     offset i*chunkSize, so f.file offset O == MemoryFile offset O. The base snapshot
     is therefore just the live memfd's data extents -- export = sparse copy
@@ -140,14 +144,22 @@ Revised S2/S3 (grounded by F1-F5):
   the base mapping (F4); base-aware bookkeeping (A4/A5/A6).
 
 ## Prototyped so far
-- A1 (shared-base option), A2/S1b (finer sub-chunk mapping), and D1/F6
-  (ExportLinearBase base production): implemented, compile into runsc
-  (gvisor3-s1.pgalloc.patch), and verified by in-tree bazel tests
-  (sharedbase_test.go): TestSharedBaseCOW (base-backed reads, shared base across two
-  MemoryFiles, private/COW writes leave base file + other MemoryFile unchanged) and
-  TestExportLinearBaseAndShare (export a populated MemoryFile, then use the exported
-  file as a SharedBaseFile and read it back -- the S2->S1 loop). Both PASS under
-  `bazel test //pkg/sentry/pgalloc:pgalloc_test`.
-- Remaining heavy work: A6/B1 (save+restore base/delta split) and B3
-  (verify-before-expose) -- this is what makes real runsc clones share; plus F5
-  (delta computation) and the MemoryFile bookkeeping (A4/A5).
+- A1 (shared-base option), A2/S1b (finer sub-chunk mapping), D1/F6 (ExportLinearBase
+  base production), and F4 (base+delta apply mechanism): implemented, compile into
+  runsc (gvisor3-s1.pgalloc.patch), and verified by in-tree bazel tests
+  (sharedbase_test.go), all PASS under `bazel test //pkg/sentry/pgalloc:pgalloc_test`:
+  - TestSharedBaseCOW: base-backed reads, shared base across two MemoryFiles,
+    private/COW writes leave the base file + the other MemoryFile unchanged.
+  - TestExportLinearBaseAndShare: export a populated MemoryFile, then use the
+    exported file as a SharedBaseFile and read it back -- the S2->S1 loop.
+  - TestBasePlusDeltaRestore: map a shared base, apply a delta over it (COW), read
+    base+delta with isolation; base file immutable; a no-delta clone reads pure base
+    -- the S3 restore-apply mechanism (F4).
+- MECHANISM uncertainty for GVISOR-3 is now retired (map-base + export-base +
+  apply-delta-over-base all proven in-tree).
+- Remaining is INTEGRATION, not mechanism: B1/B2 (wire the apply path into runsc's
+  restore -- LoadFrom skips the base range, loads only the delta), F5/A6 (compute the
+  per-agent delta at save time + exclude base pages from the saved image), the
+  base-aware MemoryFile bookkeeping (A4/A5 decommit/accounting), and B3
+  (verify-before-expose). This integration is what makes REAL runsc clones share
+  (flattens the measured 1674 MiB / 3-clone baseline toward ~1 x base + N x delta).

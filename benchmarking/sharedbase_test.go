@@ -158,3 +158,92 @@ func TestExportLinearBaseAndShare(t *testing.T) {
 		t.Fatalf("shared base from export mismatch at fr2=%v", fr2)
 	}
 }
+
+// TestBasePlusDeltaRestore proves the S3 restore-apply mechanism (ledger F4):
+// map a shared base, then WRITE the per-agent delta pages over it (COW), yielding
+// a base+delta view with isolation -- without touching the base file or peers.
+func TestBasePlusDeltaRestore(t *testing.T) {
+	pg := int(hostarch.PageSize)
+	mkMF := func(opts MemoryFileOpts) *MemoryFile {
+		b, err := os.CreateTemp("", "llifs-mf-*")
+		if err != nil {
+			t.Fatal(err)
+		}
+		os.Remove(b.Name())
+		f, err := NewMemoryFile(b, opts)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return f
+	}
+
+	// Base: page0=0xAA, page1=0xBB.
+	src := mkMF(MemoryFileOpts{})
+	defer src.Destroy()
+	sfr, err := src.Allocate(uint64(2*pg), AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssl, err := src.MapInternal(sfr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sb := ssl.Head().ToSlice()
+	sb[0] = 0xAA
+	sb[pg] = 0xBB
+	base, err := os.CreateTemp("", "llifs-base-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.Remove(base.Name())
+	defer base.Close()
+	exSize, err := src.ExportLinearBase(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Clone A: map base, then apply a delta (page1 -> 0xCC) by writing over it.
+	a := mkMF(MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: exSize})
+	defer a.Destroy()
+	afr, err := a.Allocate(uint64(2*pg), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	asl, err := a.MapInternal(afr, hostarch.ReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ab := asl.Head().ToSlice()
+	if ab[0] != 0xAA || ab[pg] != 0xBB {
+		t.Fatalf("clone A pre-delta should read base: %x %x", ab[0], ab[pg])
+	}
+	ab[pg] = 0xCC // delta apply (COW)
+	if ab[0] != 0xAA || ab[pg] != 0xCC {
+		t.Fatalf("clone A post-delta want AA,CC got %x,%x", ab[0], ab[pg])
+	}
+
+	// Base file must be unchanged by the delta.
+	chk := make([]byte, 1)
+	if _, err := base.ReadAt(chk, int64(sfr.Start)+int64(pg)); err != nil {
+		t.Fatal(err)
+	}
+	if chk[0] != 0xBB {
+		t.Fatalf("base file mutated by clone A delta: %x", chk[0])
+	}
+
+	// Clone B: same base, NO delta -> pure base (page1 still 0xBB), isolated from A.
+	b := mkMF(MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: exSize})
+	defer b.Destroy()
+	bfr, err := b.Allocate(uint64(2*pg), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bsl, err := b.MapInternal(bfr, hostarch.Read)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bb := bsl.Head().ToSlice()
+	if bb[0] != 0xAA || bb[pg] != 0xBB {
+		t.Fatalf("clone B (no delta) want AA,BB got %x,%x", bb[0], bb[pg])
+	}
+}
