@@ -110,9 +110,15 @@ The chunk mmap is the easy part. Correctness needs four more things:
   pages-file + stateify-metadata path, so the base-backed-skip changes can be
   verified as a unit (pages file = stateio FD writer/reader over a temp file;
   metadata = a bytes.Buffer; timeline nil; DisableMemoryAccounting to avoid the
-  sentry-global usage accounting). Next within S3: skip the base-backed set in
-  SaveTo (A6) and LoadFrom, threading it through memoryFileSaved, verified by
-  extending the round-trip harness to save with a base and restore over it.
+  sentry-global usage accounting). Third piece done: SAVE-side A6 -- SaveOpts gains
+  SharedBaseFile/SharedBaseBytes, SaveTo's scan threads a `nowBase` page state so
+  base-identical committed pages are excluded from the pages file and recorded in
+  memoryFileSaved.baseBacked (stateify autogen regenerates automatically), verified
+  by TestSaveWithBaseExcludesDelta (16 pages, 3 delta -> with-base save writes 3,
+  records 13 base-backed). Next: the LOAD side -- per finding F8, LoadFrom does its
+  OWN mmap and the async loader writes to the memfd FD, so the load side must
+  overlay [0,baseBytes) MAP_PRIVATE in LoadFrom, skip baseBacked from loading, and
+  apply base-range delta over the mapping (COW). This is a distinct, larger piece.
 - S4: N-clone runsc test measuring the flatten (expect ~1 x base + N x delta,
   vs the measured 1674 MiB baseline).
 - S5: Terrapin verify-before-expose on base fault-in (userfaultfd), tying in the
