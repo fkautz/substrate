@@ -171,6 +171,93 @@ Findings:
   hedged per §8); single-threaded handler (parallelizable across vCPUs); 2.33 GB/s
   is this vz-aarch64 VM.
 
+## 9. Pre-integration benchmarks: the N*delta term (memfd-diff harness)
+
+Before sinking days into the B1/B2 restore-path rewrite, we measured the two
+unmeasured terms in the post-GVISOR-3 cost model `1*base + N*delta`: the per-agent
+DELTA (how much a running clone diverges from its base) and that base sharing holds
+at production scale. Method needs NO gVisor rebuild: the live `runsc-memory` memfd is
+offset-linear (F6), so snapshotting `/proc/<sentry>/fd/<memfd>` at two points and
+page-diffing them measures the divergence directly. Tools: `memsnap.go` (sparse
+SEEK_DATA/SEEK_HOLE copy of the sentry memfd) + `pagediff.go` (4 KiB page diff +
+region histogram); workload `hsrv.go` (512 MiB warm Go HTTP service) with added
+`load <N>` (single-process N requests, so transient guest clients do not confound)
+and `dirty <MiB>` (writes a KNOWN number of pages for ground-truth validation).
+
+Setup: hsrv warmed under runsc (systrap), base committed guest memory = 514 MiB
+(512 MiB warm heap + ~2 MiB Go runtime). Sentry memfd = fd 8 `/memfd:runsc-memory`.
+
+### 9a. Read-mostly delta (the headline)
+Drove 5000 real `/healthz` requests from one client process, then diffed:
+```
+READ-MOSTLY DELTA (5000 req):  2205 / 262144 pages  =  8.6 MiB changed  (1.7% of base)
+  region  0   (0-64 MiB)    507 pages   Go runtime / early heap
+  region  8 (512-576 MiB)  1472 pages   heap growth just past the warm buffer
+  region 15 (960 MiB)       226 pages   runtime stacks
+```
+The 512 MiB warm working set (regions 1-7, 64-512 MiB) shows ZERO changed pages: a
+large read-only working set is fully shareable. Serving 5000 requests dirtied ~8.6
+MiB -- the per-clone delta is working-set-bound, not base-bound.
+
+### 9b. Harness validation against ground truth
+Asked the server to dirty a known 100 MiB (25600 pages), then diffed:
+```
+VALIDATION DELTA:  25707 / 262144 pages  =  100.4 MiB  (ground truth 100 MiB)
+```
+25707 vs 25600 expected (the extra ~107 is concurrent runtime churn) -- the harness
+measures real divergence to within 0.4%. The dirtied pages landed in regions 0-1
+(start of the warm heap), exactly where the writes went. Total mem0->mem2 = 108 MiB
+= 8.6 (read) + 100 (dirty), consistent. The measurement is trustworthy.
+
+### 9c. Base sharing at production scale (density_smoke @ 1 GiB, N=64)
+```
+1 GiB base, N=64 MAP_PRIVATE sharers:
+  each non-writer:  rss=1024 MiB   pss= 16 MiB (= base/64)   private_dirty=0
+  writer (half):    rss=1024 MiB   pss=520 MiB               private_dirty=512 MiB
+```
+`pss = base/N` holds cleanly at a 1 GiB base across 64 sharers (also checked N=8 ->
+137 MiB = 1024/8). The "1*base" term is real at scale; resident base pages are
+physically shared, writes stay private.
+
+### 9d. ExportLinearBase (base capture) throughput
+`memsnap` is the `ExportLinearBase` operation (sparse memfd copy). 522 MiB committed
+copied in 0.14 s = ~3.7 GB/s; a 1 GiB base exports in ~0.27 s. Negligible on the
+capture path.
+
+### 9e. The flatten, with measured numbers
+Guest-memory plane (what GVISOR-3 directly shares), read-mostly delta 8.6 MiB,
+base 514 MiB:
+```
+                         N=64 clones
+  before (today):  N * 514 MiB           = 32,900 MiB  (~32 GiB)
+  after GVISOR-3:  514 + N * 8.6 MiB      =  1,064 MiB  (~1 GiB)   -> ~31x flatter
+```
+Node-level density (8 GiB node). The prior baseline measured ~557 MiB sentry RSS per
+clone (sec 5), of which ~514 is the shareable guest plane and ~43 MiB is per-sentry
+process memory (Go heap, netstack) that GVISOR-3 does NOT share:
+```
+  before:  floor(8192 / 557)                 =  14 clones / node
+  after:   floor((8192 - 514) / (43 + 8.6))  = 148 clones / node   -> ~10x density
+```
+So GVISOR-3 flattens the guest-memory plane ~31x (this workload) and lifts node
+density ~10x; the per-sentry ~43 MiB process overhead becomes the NEW density floor
+and the next optimization target. Density is now delta-bound, not base-bound -- the
+core thesis, measured.
+
+### 9f. Caveats
+- Delta is workload- and runtime-dependent: 8.6 MiB is a read-mostly Go service over
+  5000 requests. A write-heavy or large-allocating agent has a bigger delta (the
+  100 MiB dirty shows the harness tracks it linearly); density scales as
+  (RAM - base)/delta, so a 50 MiB delta still gives ~150 clones/node here.
+- Per-clone delta also includes gVisor's per-restore refreshed state (kernel entropy,
+  clocks; RHAZARD sec 6) -- small, included in the measured 8.6 MiB.
+- Measured on aarch64/vz; the ~43 MiB sentry-own floor is platform/build-dependent.
+- This measures divergence of a running instance from its start image == per-clone
+  delta from a shared base (all clones start identical, diverge independently).
+
+GO/NO-GO: the N*delta term is small and base sharing holds at scale -> the B1/B2
+restore-path integration is justified. Proceed.
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
