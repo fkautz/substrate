@@ -305,6 +305,23 @@ guest-observable flatten. The mechanism is right but must be moved to the DataFD
 layer to flatten the guest mapping. Treat the ~10x here as the sentry-mapping result
 pending the platform-layer redo.
 
+X86_64 REPRODUCTION (2026-06-30): the same patched gVisor was built and the suite re-run
+on x86_64 (an Intel i9-8950HK host) to confirm the flatten is not aarch64-specific. All
+10 GVISOR-3 pgalloc tests pass, and TestNCloneFlatten reproduces the aarch64 numbers
+essentially exactly:
+
+```
+config                       aarch64   x86_64    x86 Pss / Rss
+N=8,  base=128MiB, delta=8     4.9x      4.9x     215 / 1057 MiB
+N=16, base=128MiB, delta=4    10.1x     10.1x     205 / 2068 MiB
+N=32, base=64MiB,  delta=2    15.0x     15.1x     137 / 2061 MiB
+```
+
+So the base/delta save-restore flatten is architecture-independent through the real
+SaveTo/LoadFrom path. (Still the sentry-mapping layer per F9; a live-KVM guest-observable
+run remains pending bare-metal /dev/kvm, which the available Intel host could not provide
+because it is a VMware nested guest, see sec 13.)
+
 ## 11. B3: Terrapin verify-before-expose composed with the flatten
 
 Section 10 measured the flatten WITHOUT integrity (a trusted local base). B3 adds
