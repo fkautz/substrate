@@ -1,12 +1,12 @@
 # Sharing gVisor guest memory worked on KVM. Snapshot restore mattered more.
 
-I started with a memory-density question: can thousands of restored gVisor sandboxes share
+The starting question was about memory density: can thousands of restored gVisor sandboxes share
 the same warmed guest RAM copy-on-write, instead of each clone materializing a private copy?
 The answer is yes on KVM. Through gVisor's real `MemoryFile` save/restore path, shared-base
 restore cut physical memory by roughly 5× to 17× in controlled tests, and a live KVM guest
 restored and ran correctly over the shared base.
 
-But the more useful result was not the one I set out to find. A real agent showed that small
+But the more useful result was not the one this work set out to find. A real agent showed that small
 workloads quickly hit a fixed per-sandbox memory floor, which limits the density win. The
 bigger, portable win was snapshot restore itself: skipping Python and framework
 cold start made agents resume several times faster and cheaper on both KVM and systrap. The
@@ -40,7 +40,7 @@ large and the per-clone delta is small, the economics change from one full RAM c
 clone to one base plus N deltas. Keep one physical copy of the base, share it copy-on-write,
 and density becomes **delta-bound, not base-bound**.
 
-I will call the improvement factor the **flatten**: the ratio of would-be private resident
+Call the improvement factor the **flatten**: the ratio of would-be private resident
 memory (every clone a full copy) to shared physical memory (one base plus the per-clone
 deltas). A 10× flatten means the clones consume roughly one-tenth the physical RAM they
 would as full copies.
@@ -185,7 +185,7 @@ as hoped, and now through gVisor's real memory path rather than a toy.
 
 A shared base becomes a security question the moment it comes from anywhere other than the
 sandbox itself: a node-local cache, a peer, an object store. A base page should not be mapped
-into a sandbox unless it is certain to be the page it claims to be. The rule I want is
+into a sandbox unless it is certain to be the page it claims to be. The rule to enforce is
 **verify-before-expose**: no byte reaches the guest without being checked first.
 
 The check is content-addressing, using Terrapin. Terrapin gives the whole base image a
@@ -479,7 +479,7 @@ right next to a broader result that turned up alongside it: restore
 an agent instead of cold-starting it, and each start is warm, correct, and several times
 cheaper on both platforms tested.
 
-## What I learned
+## What the work showed
 
 - **The kernel primitive and the economics check out.** Linux shares `MAP_PRIVATE` file pages
   copy-on-write (PSS ≈ base/N), and a read-mostly agent's per-clone delta is ~1.7% of its RAM.
@@ -522,7 +522,7 @@ Base sharing works where the platform consumes the sentry's composed memory view
 systrap does not. That makes memory sharing a real density bonus on KVM when the active
 resident base is large enough.
 
-The result I would build around first is broader: do not cold-start near-identical agents.
+The result to build around first is broader: do not cold-start near-identical agents.
 Snapshot them after initialization and restore them when needed. Skipping startup is the portable win; shared guest memory is the KVM bonus.
 
 ## Measurement details
