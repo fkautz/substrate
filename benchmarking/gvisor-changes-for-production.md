@@ -295,6 +295,14 @@ F9. [found][CRITICAL] The base overlay must live at the DataFD/MapFile layer (th
     NET: GVISOR-3 base/delta + overlay is the right design for the KVM platform (where
     LLIFS density matters most); systrap (a ptrace/seccomp fallback) needs KSM or a
     deeper mechanism. The C1 restore plumbing is platform-agnostic and reusable.
+    CONFIRMED ON KVM (2026-07-01): on a GCE nested-virt instance with real /dev/kvm,
+    the same patched runsc runs `--platform=kvm` (no host crash, unlike VMware nested),
+    and `runsc restore --platform=kvm` over a base.img RESUMES the guest with memory
+    intact (cr_workload tick continues, checksum=ok; debug log confirms the base was
+    threaded and the overlay applied) -- whereas the identical restore-over-base crashes
+    the guest on systrap. This empirically closes F9: the overlay reaches the guest on
+    KVM. Remaining for a runsc-observable flatten MAGNITUDE = checkpoint-side base
+    plumbing (C1b), now de-risked (see density-prototype-findings sec 13a).
 
 F8. [found][CORRECTED] LoadFrom bypasses the extendChunksLocked base overlay. On
     restore, LoadFrom does its OWN single mmap of f.file (MAP_SHARED over the whole
