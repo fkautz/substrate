@@ -53,7 +53,7 @@ The rest of the post walks the evidence in order:
 | Live gVisor memory diff | Is the per-clone delta small? | 5000 requests to a warmed Go server changed 8.6 MiB, about 1.7% of base. |
 | gVisor `MemoryFile` tests | Does base/delta save/restore preserve memory? | Yes, through both the sync and async load paths. |
 | runsc on systrap | Does a real restored guest run over the overlay? | No. systrap maps guest memory from the memfd in a separate stub. |
-| runsc on KVM | Does the same design run end to end? | Yes. The guest resumed correctly over the shared base. |
+| runsc on KVM | Does the same design run end-to-end? | Yes. The guest resumed correctly over the shared base. |
 | Real ADK agent | Is density the main product win? | Not for small agents. Restore latency was the larger, cross-platform win. |
 
 ## Does the OS even do this?
@@ -189,10 +189,12 @@ into a sandbox unless it is certain to be the page it claims to be. The rule I w
 **verify-before-expose**: no byte reaches the guest without being checked first.
 
 The check is content-addressing, using Terrapin. Terrapin gives the whole base image a
-single dataset identity, `terrapin-sha256:<digest>`. The base is split into 2,097,152-byte
+single dataset identity, `terrapin-sha256:<digest>`.
+
+The base is split into 2,097,152-byte
 (2 MiB) blocks, with the final block allowed to be smaller. Each leaf is hashed with GitOID SHA-256, the Git blob
-construction `sha256("blob " + len + "\0" + data)`; the leaf hashes are recursively reduced
-to a tree root; and that root is wrapped in a canonical manifest that commits the algorithm,
+construction `sha256("blob " + len + "\0" + data)`. The leaf hashes are recursively reduced
+to a tree root, and that root is wrapped in a canonical manifest that commits the algorithm,
 block size, total length, and tree root. The Terrapin identifier is the GitOID of that
 canonical manifest, not the bare tree root, so the identity is unambiguous about size and
 tree height and cannot be reinterpreted at a different block size.
@@ -389,7 +391,7 @@ Everything so far used workloads built to be measurable: a Go HTTP server, a C p
 checksummed heap. A real one was needed to trust the result. The choice was an agent on
 Google's Agent Development Kit (google-adk) with the LLM endpoint mocked out, so it drives the
 full framework (sessions, the runner, the model interface) with no network. Checkpointed and
-restored under KVM, it came back correctly: live Python, asyncio, and grpc all intact.
+restored under KVM, it came back correctly: live Python, asyncio, and gRPC all intact.
 
 The density flatten for the real agent was modest: about 2.9× across eight clones over an 80
 MiB base. Two honest reasons, and both matter more than the number.
@@ -473,9 +475,9 @@ there is no `/dev/kvm`:
 Faster than KVM here, in fact, because gVisor's KVM backend pays nested-virtualization
 overhead on the rented cloud host; on bare metal that gap narrows. The exact number is not the
 point. The point is that the conditional, KVM-only feature this work set out to build sits
-right next to an unconditional, works-everywhere result that turned up alongside it: restore
+right next to a broader result that turned up alongside it: restore
 an agent instead of cold-starting it, and each start is warm, correct, and several times
-cheaper, on any platform.
+cheaper on both platforms tested.
 
 ## What I learned
 
@@ -486,10 +488,8 @@ cheaper, on any platform.
   scales 5× to 17× with clone count at the pgalloc layer; on a live KVM guest through the
   runsc CLI it is lower (about 5.7× at eight clones, 2.9× for a real 80 MiB agent) because of a
   per-sandbox floor the pgalloc tests never see.
-- **That floor is the real density ceiling, not the language or the mechanism.** About 20 MiB
-  per sandbox, half of it live Go runtime across two processes, on top of a full guest kernel.
-  Base sharing wins only when the shared resident base is large next to that floor, which the
-  floor-limited ceiling makes precise.
+- **The floor is the density ceiling.** About 20 MiB per sandbox is not shareable, so base
+  sharing only wins big when the shared resident base is large next to that floor.
 - **Verify-before-expose composes without hurting density.** Terrapin verification of the
   shared base, once per node against an authenticated dataset ID, did not materially change the
   measured resident-memory flatten; tampering is caught before exposure.
@@ -523,8 +523,7 @@ systrap does not. That makes memory sharing a real density bonus on KVM when the
 resident base is large enough.
 
 The result I would build around first is broader: do not cold-start near-identical agents.
-Snapshot them after initialization and restore them when needed. Skipping startup is the win
-everywhere; shared guest memory is the KVM bonus.
+Snapshot them after initialization and restore them when needed. Skipping startup is the portable win; shared guest memory is the KVM bonus.
 
 ## Measurement details
 
@@ -554,4 +553,4 @@ node. Capturing a base from a live sandbox runs at ~3.7 GB/s.
 **Environment.** Density and latency runs were on a GCE `n2-standard-4` (four vCPUs, ~15 GiB,
 nested virtualization enabled for real `/dev/kvm`); gVisor built from source with the base/delta
 patches. The nested-KVM host mattered: gVisor's KVM backend crashed the machine under
-Apple-silicon and VMware nesting, and only Google's genuine Linux-KVM nesting ran it cleanly.
+Apple-silicon and VMware nesting, and only GCE's Linux KVM-backed nested virtualization ran it cleanly.
