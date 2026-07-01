@@ -2,7 +2,8 @@
 
 *A field report on making thousands of near-identical gVisor sandboxes share one
 physical copy of their RAM: what I tried, the questions that kept surfacing, what I
-measured, and the bug that only an end-to-end test could find.*
+measured, the bug that only an end-to-end test could find, and, once I finally got the
+hardware, the win I was not looking for.*
 
 ## The problem: density is a memory wall
 
@@ -40,11 +41,14 @@ RAM they would have as full copies.
 
 **The result, upfront.** Through gVisor's actual `MemoryFile` save/restore path, shared
 base restore produced roughly 5× to 17× lower physical memory than full private restores
-in the tested configurations. Content-addressed verification did not change the flatten.
-The surprise was platform-specific: the prototype lines up with KVM's guest-memory path,
-but systrap maps guest memory through a different memfd path, so the restored workload
-crashed there even though the pgalloc tests passed. The rest of this post is how I got to
-each of those.
+in the tested configurations, and content-addressed verification did not change the
+flatten. Then it crashed. The prototype lines up with KVM's guest-memory path, but systrap
+maps guest memory through a different memfd path, so the restored workload died there even
+though the pgalloc tests passed. Later I got a machine with real `/dev/kvm` and confirmed
+the other half: on KVM the same workload restores over a shared base and runs, exactly as
+the code predicted. And testing a real agent instead of a toy, I found a bigger win than
+the one I set out for, a startup saving that works on every platform. The rest of this post
+is how I got to each of those.
 
 ## Question 1: does the OS even do this?
 
@@ -331,37 +335,182 @@ that matters for density (KVM), and it was tested on the fallback platform where
 apply." The pgalloc unit tests read through `MapInternal`, exactly the path KVM uses for
 guest memory, so they're valid coverage of the real target.
 
+## Getting to real KVM
+
+That is where the story sat: the design lines up with KVM, but my Apple-silicon setup had
+no `/dev/kvm`, so I could not prove it on a running guest. It bothered me enough to go find
+hardware.
+
+The answer was Google Cloud. A GCE instance with nested virtualization enabled exposes a
+real `/dev/kvm`, and because Google's nested virtualization is genuine Linux KVM, the
+platform gVisor's KVM backend is built for, gVisor runs there without the host-resetting
+crashes I hit trying to nest KVM under Apple's or VMware's hypervisors. I built the same
+patched runsc on that instance and ran the test the story above could not.
+
+First, `runsc --platform=kvm` ran a sandbox at all, and the host stayed up. Then the one
+that mattered. I checkpointed the same small stateful workload and restored it two ways,
+this time on KVM:
+
+```
+restore WITHOUT base.img (--platform=kvm):  ticks continue, checksum=ok   (regression clean)
+restore WITH    base.img (--platform=kvm):  ticks continue, checksum=ok   ✅
+```
+
+The workload that crashed on systrap resumed cleanly on KVM, memory intact, with the debug
+log confirming the base image was threaded in and the overlay applied. The platform-shaped
+hypothesis was not a hedge. KVM maps the guest from `MapInternal`, exactly the mapping the
+overlay modifies, so the guest sees the shared base and the copy-on-write delta, while the
+same restore on systrap still dies because its stub reads a different memfd. Predicted from
+the code, confirmed on hardware.
+
+I also finished the half the story above was missing: the checkpoint side.
+`runsc checkpoint --shared-base` now exports the base and writes a delta-only checkpoint.
+For a freshly warmed clone the delta is zero, so the pages file comes out empty and all of
+guest RAM lands in the shared base image. With both sides in place I could measure the
+flatten through the real runsc CLI on a live KVM guest instead of through the pgalloc
+tests: eight real sandboxes restored over one shared 256 MiB base gave a 5.7× flatten in
+summed sentry PSS.
+
+That is lower than the ~10× the pgalloc tests reported, and the gap is the whole next
+section.
+
+## A real agent, and a humbler flatten
+
+Everything so far used workloads I built to be measurable: a Go HTTP server, a C program
+with a checksummed heap. To trust the result I needed a real one, so I ran an agent on
+Google's Agent Development Kit (google-adk) with the LLM endpoint mocked out, so it drives
+the full framework (sessions, the runner, the model interface) with no network, and
+checkpointed and restored it under KVM. Live Python, asyncio, and grpc all came back
+correctly.
+
+The density flatten for the real agent was modest: about 2.9× across eight clones over an
+80 MiB base. Two honest reasons, and both matter more than the number.
+
+First, the flatten only ever applies to memory that is actually resident. I tried to
+inflate the base by having the agent allocate a gigabyte at startup, and it did nothing:
+memory the clones never touch after restore is never faulted in, so it costs no physical
+RAM and there is nothing to share. Density scales with the shared resident working set, not
+with allocated size.
+
+Second, and this is the ceiling I had not measured before, each sandbox carries a fixed
+floor of about 20 MiB that cannot be shared: roughly 17 MiB of sentry and 3 MiB of gofer,
+about half of it live Go runtime across those two Go processes. It is not garbage the
+collector can reclaim (I tried capping it and nothing moved); it is threads, goroutine
+stacks, and runtime structure, on top of a full guest kernel. The sentry is around 277,000
+lines of Go implementing 645 syscalls, which is not a thing you shrink. So the density math
+is `(base + floor) / (base/N + floor)`, and an 80 MiB base on a 20 MiB floor cannot flatten
+far. On a 15 GiB, four-core box I could pack about 300 of these sandboxes before memory ran
+out. The flatten is real, but it pays off only when the shared resident base is large next
+to that floor, which for a small agent it is not.
+
+I could have stopped there with a lukewarm verdict on density. Instead the same agent
+handed me the actual result.
+
+## The win I was not looking for
+
+Cold-starting the agent under gVisor takes about eleven seconds, almost all of it CPU:
+importing roughly 1,400 Python modules, most of the time inside the Gemini SDK constructing
+its Pydantic type hierarchy as the modules load. It is not fetching anything (the sandbox
+has no network and the packages are pre-installed) and not compiling bytecode (every `.pyc`
+is already there); it is executing that much initialization code, amplified by gVisor's
+per-syscall cost on a file-heavy import.
+
+Restoring from a snapshot skips all of it. It maps the already-initialized image and
+resumes:
+
+```
+                 cold start (import + init)      restore from snapshot
+ wall            11.4 s                          0.6 s
+ CPU              7.1 s                          ~0.5 s
+```
+
+"Sub-second restore" is exactly the kind of claim that hides a fault-in stall, so I went to
+break it. Three checks.
+
+*Is it actually warm?* Yes. The restored agent serves its first real request in about 0.6
+seconds and its second in 29 milliseconds, steady at 20. There is no multi-second thrash.
+(One of my own instruments read three seconds for the first request and briefly scared me.
+It was an artifact: a wall-clock timer that had been running across the checkpoint freeze.
+The external clock and the 29 ms second request said otherwise.)
+
+*Is it correct?* Bit-exact. Every post-restore response verified through the full agent
+path, and an in-memory accumulator I had the agent keep came back with precisely the value
+it would have had if it had never stopped.
+
+*Is it cheap to park?* Checkpointing takes 0.11 seconds, and with a shared base each parked
+agent costs about 248 KiB (its kernel state plus a near-zero delta) instead of the ~81 MiB
+of a full checkpoint. A pool of ten thousand parked agents is a couple of gigabytes instead
+of most of a terabyte.
+
+The one caveat is burst. A single restore is sub-second, but fifty at once on four cores
+take about 18 seconds and a hundred take forty-plus, because each restore plus its first
+request is roughly 1.5 seconds of CPU and they contend for the cores. So restore is not
+instant scale-up. It is about four times cheaper per start than a cold start, at every
+scale, which is a narrower and more defensible claim: you provision cores for your burst
+rate, and each start costs a quarter of what it did.
+
+## The part that runs anywhere
+
+Here is the twist that ties back to the platform-shaped surprise. The density flatten is
+KVM-only, because it depends on the base overlay reaching the guest, and that only happens
+on KVM. But skipping the cold start does not use the overlay at all. It needs only
+checkpoint and restore, which work on every gVisor platform. So I ran the same
+cold-versus-restore test on systrap, the no-`/dev/kvm` platform most gVisor deployments
+actually use:
+
+```
+ systrap    cold 4.05 s / 1.99 s CPU   →   restore 0.18 s / 0.26 s CPU   (correct)
+```
+
+Faster than KVM here, in fact, because gVisor's KVM backend pays nested-virtualization
+overhead on the rented cloud host; on bare metal that gap narrows. The exact number is not
+the point. The point is that the conditional, KVM-only feature I set out to build turned
+out to sit right next to an unconditional, works-everywhere win I found by accident:
+restore an agent instead of cold-starting it, and each start is warm, correct, and several
+times cheaper, with no special platform required.
+
 ## What I learned
 
 - **The kernel primitive and the economics check out.** Linux shares `MAP_PRIVATE` file
   pages copy-on-write (PSS ≈ base/N), and a read-mostly agent's per-clone delta is ~1.7%
   of its RAM. Density is delta-bound.
-- **The flatten is real through gVisor's actual save/restore memory path:** roughly 5× to
-  17× scaling with clone count, ~90% of ideal, at the `MapInternal` layer KVM uses for
-  guest memory. The live-KVM end-to-end run is still the missing confirmation.
+- **The flatten is real, and it turned out to be the smaller prize.** Through gVisor's
+  save/restore path it scales 5× to 17× with clone count at the pgalloc layer, and on a
+  live KVM guest through the runsc CLI it is lower (about 5.7× at eight clones, 2.9× for a
+  real 80 MiB agent) because of a per-sandbox floor the pgalloc tests never see.
+- **That floor is the real density ceiling, not the language or the mechanism.** About 20
+  MiB per sandbox, half of it live Go runtime across two processes, on top of a full guest
+  kernel, none of it shareable and little of it reducible. Base sharing wins only when the
+  shared resident base is large next to that floor.
 - **Verify-before-expose composes without hurting density.** Content-addressed verification
   of the shared base, done once per node against trusted metadata, adds no per-sandbox
   resident memory and doesn't move the flatten; tampering is caught before exposure.
 - **`memmap.File` / `MapFile` / `DataFD` hides a load-bearing platform difference.** KVM
   maps the guest from the sentry's `MapInternal`; systrap maps it from the memfd FD into a
   separate stub. A memory feature that lives in `pgalloc` is implicitly making a bet about
-  which of those the guest uses. Mine was right for KVM, wrong for systrap.
-- **End-to-end tests find what unit tests can't.** Nine green unit tests and a measured
-  flatten did not catch that the running guest reads a different mapping. One real
-  checkpoint/restore did, immediately.
+  which of those the guest uses. Mine was right for KVM (confirmed on real hardware) and
+  wrong for systrap, exactly as the code predicted.
+- **End-to-end tests, and real workloads, find what unit tests cannot.** Nine green unit
+  tests found a measured flatten. One real checkpoint/restore found the platform bug. And
+  one real agent found that the memory density I was chasing was a conditional bonus, while
+  the startup saving I was not chasing was the robust, universal result.
 
 ## What's next
 
-- **Validate on KVM hardware.** The numbers above should reproduce against a live runsc
-  guest on a host with `/dev/kvm`; that's the missing end-to-end confirmation. It needs the
-  checkpoint-side base plumbing (currently restore-side only) and base-image production
-  finished first.
-- **A systrap story.** Either KSM as a pragmatic, verification-free dedup, or a coherent
-  shared-base plus delta overlay across the sentry/stub pair (userfaultfd write-protect
-  promote-to-shared-delta) for explicit, verified sharing.
+- **Density on a large active base.** The flatten is modest for a small agent, and should
+  be large for one that keeps a big model or index resident and reads it every turn. That
+  is the one measurement that would make the density case, and I have not run it end to end.
+- **A systrap density story.** The latency win already works on systrap; the memory win
+  does not. Kernel-samepage-merging on the per-sandbox memfds is the pragmatic,
+  verification-free option; a coherent shared-base-plus-delta across the sentry and stub is
+  the explicit one.
+- **The floor itself.** The one tractable piece of the 20 MiB floor is the gofer, which
+  directfs already sidelines at runtime but still runs as a whole second Go process.
+  Reaping it is worth more than any GC tuning.
 - **Base-aware accounting.** Resident base pages should be counted once per node, not once
-  per sandbox: partly a gVisor change, partly a node-level concern.
+  per sandbox.
 
-The mechanism is sound where density matters. The surprise was a reminder that in gVisor,
-"guest memory" is not one thing, and which mapping you share decides whether the guest
-ever sees it.
+The mechanism is sound where density matters, and I proved it on the platform that matters.
+But the lesson I did not expect is the one I would lead with now: for a fleet of
+near-identical agents, the cheapest thing you can do is not start them at all, and restore
+is how you avoid it. Sharing their memory is a bonus on top.
