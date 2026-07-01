@@ -472,6 +472,39 @@ So the test landing on systrap (forced by no nested KVM) is why base.img restore
 crashed; the design is sound for KVM, the platform where LLIFS density matters most.
 The C1 restore plumbing is platform-agnostic and reusable.
 
+### 13a. KVM CONFIRMED (2026-07-01): the overlay reaches the guest, restore-over-base works
+
+F9 was resolved by code reading (KVM MapFile uses MapInternal), but untestable on the
+available hardware until a real /dev/kvm host was found. A GCE nested-virt instance
+(n2-standard-4, Ubuntu 24.04, nested virtualization on -> real Linux/KVM, which gVisor's
+KVM platform supports, unlike VMware-on-Mac nested) gave working /dev/kvm ("KVM
+acceleration can be used"). Same patched runsc (928199eb9-dirty) built there. Results:
+
+```
+runsc --platform=kvm do echo         -> "KVM-PLATFORM-OK", host stays up (systrap-on-VMware
+                                        hard-reset the box; real KVM just runs)
+checkpoint cr_workload under KVM      -> tick 1..5, checksum=ok, 67 MiB pages.img
+restore --platform=kvm  WITHOUT base  -> tick 6..12, checksum=ok           (regression clean)
+restore --platform=kvm  WITH base.img -> tick 6..13, checksum=ok           (F9 PROOF)
+   debug: "Restoring main MemoryFile over shared base image .../base.img (1073741824 bytes)"
+```
+
+So on KVM the base overlay is threaded in AND the guest resumes with memory intact
+(checksum=ok), whereas the identical restore-over-base CRASHED the guest on systrap
+(sec 13). This empirically confirms F9: the GVISOR-3 base/delta overlay lives at the
+MapInternal layer, and KVM feeds the guest from exactly that layer, so restore-over-base
+is correct end to end on a live KVM guest. Combined with the pgalloc flatten (~10x,
+measured at the same MapInternal layer, both arches, sec 10), the design is validated for
+the production KVM platform.
+
+REMAINING for a runsc-OBSERVABLE flatten MAGNITUDE on KVM: this run used a NORMAL
+checkpoint + a zero base.img, so every page is loaded (COW) over the overlay -- it proves
+CORRECTNESS (the overlay reaches the guest), not the N-clone memory saving. Measuring the
+magnitude through runsc needs the CHECKPOINT-side base plumbing (SaveOpts.SharedBaseFile
+through kernel.SaveTo, to produce a delta-only checkpoint) plus base-image production --
+C1b. That is now fully de-risked: the hard question (does the overlay reach the guest on
+KVM?) is answered YES.
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
