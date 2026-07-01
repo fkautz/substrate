@@ -192,7 +192,7 @@ into a sandbox unless it is certain to be the page it claims to be. The rule to 
 The check is content-addressing, using [Terrapin (v0.3)](https://hackmd.io/rXTXMhjwTgGY3Yn4qEX96A). Terrapin gives the whole base image a
 single dataset identity, `terrapin-sha256:<digest>`. The scheme is cross-confirmed by two
 independent v0.3 implementations, [terrapin-go](https://github.com/fkautz/terrapin-go) and
-terrapin-rs.
+[terrapin-rs](https://github.com/fkautz/terrapin-rs).
 
 The base is split into 2 MiB blocks, exactly 2,097,152 bytes each, with the final block
 allowed to be smaller. Each leaf is hashed with GitOID SHA-256, the Git blob
