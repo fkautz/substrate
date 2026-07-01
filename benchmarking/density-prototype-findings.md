@@ -601,6 +601,38 @@ THE LATENCY WIN (this is the strongest result for agent FaaS):
   seconds to minutes, while restore stays ~sub-second. Density is workload-dependent; the
   cold-start elimination is a robust, large win regardless of base size.
 
+### 13e. Adversarial stress of the latency win (2026-07-01)
+
+Three tests aimed at breaking "restore in 0.5s":
+
+1. WARM vs THRASH -> WARM. Restored ADK agent: first response 0.6s (external clock),
+   2nd request 29ms, steady 20ms. An in-agent perf_counter read 3085ms for the first
+   post-restore request, but that is a MEASUREMENT ARTIFACT: the timer started before
+   the checkpoint, so it counted the ~3s the process sat frozen between checkpoint and
+   restore. The external wall clock (first response at 0.6s) and the 29ms 2nd request
+   disprove a real stall. rss 118->93M post-restore (untouched pages never refault);
+   the touched working set refaults over ~1 request, cheaply. No multi-second thrash.
+
+2. CORRECTNESS -> perfect. Every post-restore response semantically verified (echo
+   round-trips the full ADK path: session/runner/agent/model; resp=BAD count=0). Heap
+   state bit-exact across restore: tick 34->35, state_sum 595->630 (=595+35, the running
+   sum). Clones restore independently.
+
+3. BURST SCALE -> the real caveat. Individual restore is fast/cheap, but N CONCURRENT
+   restores are CPU-throughput-bound. On 4 vCPU:
+     N=8   -> all serving < 2s
+     N=50  -> p50=18.2s p99=19.4s (load 18, all served)
+     N=100 -> p50=41.9s p99=49.2s (load 114; 5/100 stalled past 150s)
+   Each restore + first-request costs ~1.5s CPU (mostly the working-set fault-in under
+   gVisor), so burst wall ~= N*1.5s / cores. Cold start is 7.1s CPU each, so restore is
+   ~4x cheaper CPU at ALL scales. The ROBUST claim is "~4x less CPU / ~4x more
+   start-throughput-per-core", NOT "sub-2s burst" (which only holds for bursts up to
+   ~2x core count). Restoring 100 agents ~42s vs ~178s to cold-start 100 on 4 vCPU.
+
+NET: per-agent the latency win holds (warm, correct, sub-second uncontended, ~4x cheaper
+CPU); at burst it is CPU-throughput-limited and scales with cores -- provision cores for
+the burst rate, and restore makes each start ~4x cheaper rather than magically instant.
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
