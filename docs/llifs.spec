@@ -1,6 +1,6 @@
 LLIFS Specification
 
-Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). A third hardening pass then defined the RDELTA-1 no-runtime-state exception (a signed base-descriptor field, ENC-BD-5, whose semantics are a resume-time guarantee for any later memory-persisting snapshot, not merely a property of the base restore point) and its verifier step, fixed the opaque-runtime-object framing convention (ENC-3: base runtime_state and the runtime delta are raw, unframed; all other encodings are framed), forbade the runtime delta from carrying memory/filesystem bytes (ENC-RD-1), pinned the virtual zero-subtree derivation recurrence (SPARSE-8), split runtime-delta observability (OBS-9), and added the four-interface Phase-1 implementation surface (§16.1). Phase 1 prototyping is green-lit from this draft. The §15.3 Terrapin vectors are now CROSS-CONFIRMED by two independent v0.3 oracles (terrapin-rs and terrapin-go), closing ENC-CONF-2; per-level zero-subtree roots (SPARSE-8) are pinned. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): runtime-delta implementation proof on a real gVisor hibernate/resume path; and grow atelet.WorkloadSpec (and ateom's reduced Container) to supply the full LLWI1 workload identity (docs/workload-identity-expansion.md, ENC-WI-1) - LLWI1 is the target identity and is deliberately NOT pared to the current proto, since a workload-identity mismatch is a restore-safety bug.
+Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). A third hardening pass then defined the RDELTA-1 no-runtime-state exception (a signed base-descriptor field, ENC-BD-5, whose semantics are a resume-time guarantee for any later memory-persisting snapshot, not merely a property of the base restore point) and its verifier step, fixed the opaque-runtime-object framing convention (ENC-3: base runtime_state and the runtime delta are raw, unframed; all other encodings are framed), forbade the runtime delta from carrying memory/filesystem bytes (ENC-RD-1), pinned the virtual zero-subtree derivation recurrence (SPARSE-8), split runtime-delta observability (OBS-9), and added the four-interface Phase-1 implementation surface (§16.1). Phase 1 prototyping is green-lit from this draft. The §15.3 Terrapin vectors are now CROSS-CONFIRMED by three independent v0.3 oracles (terrapin-rs, terrapin-go, and a clean-room oracle written from the §2.2/§15.3 text alone, which also validated the SPARSE-8 Z_1 recurrence), substantially discharging ENC-CONF-2; a partial-tail zero-span vector (a zero span not a whole multiple of the level-1 span) remains to add before freeze (§15.3); per-level zero-subtree roots (SPARSE-8) are pinned. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): runtime-delta implementation proof on a real gVisor hibernate/resume path; and grow atelet.WorkloadSpec (and ateom's reduced Container) to supply the full LLWI1 workload identity (docs/workload-identity-expansion.md, ENC-WI-1) - LLWI1 is the target identity and is deliberately NOT pared to the current proto, since a workload-identity mismatch is a restore-safety bug.
 System: LLIFS (a verified, deduped, lazily-faulted state substrate for high-density agent FaaS).
 Primary target: gVisor (runsc) checkpoint/restore; Firecracker microVM next. One content-addressed, Terrapin-verified store delivers two state planes: a filesystem plane and a memory plane.
 External identity: OCI-compatible sha256.
@@ -177,6 +177,13 @@ Parameters (fixed for this profile):
   node hash:   gitoid-sha256
   identifier:  G(canonical Terrapin root manifest)
   digest form: terrapin-sha256:<64 lowercase hex>
+
+Version crosswalk: profile llifs-terrapin-sha256-v2 IS the Terrapin v0.3 construction,
+whose identifier is G(canonical root manifest), NOT the bare tree root. The retired v1
+profile was Terrapin v0.2 (the bare recursive tree root), which v0.3 replaced with a
+breaking identifier change. An implementation MUST pair profile-v2 with Terrapin v0.3;
+pairing v2 with v0.2, or presenting the bare tree root as the identifier, MUST reject
+(DIGEST-2).
 
 GitOID SHA-256:
 
@@ -745,11 +752,13 @@ SPARSE-8: Virtual zero applies to PROOF blocks too, not just data. A hash-file/p
           all-zero subtree root at each level MUST be derived by the Terrapin
           node-hash recurrence over identical zero-child digests: the level-0 zero
           root is the §2.2 zero-leaf constant, and a level-L zero root is the Terrapin
-          node hash over the profile's fanout of level-(L-1) zero roots. §15.10
+          node hash over the profile's fanout (65536 = 2097152/32) of level-(L-1) zero roots. §15.10
           ENC-CONF-2 MUST pin the zero-subtree root for each level the profile uses,
           so independent implementations cannot invent divergent shortcut rules; a
           conformance vector MUST exercise a high-address mapped-data region behind a
-          large zero span.
+          large zero span, INCLUDING a partial-tail case whose zero span is not a whole
+          multiple of the level-1 zero span, so its final level-1 hash-file digest is G
+          over a shorter concatenation than Z_1, never Z_1 itself.
 
 Small files:
 
@@ -1186,9 +1195,11 @@ RHAZARD-7: Before HAZARDS_CLEARED for multi-tenant restore, each of the followin
            MUST be refreshed/invalidated or asserted not-applicable by signed
            policy: PID/TID and cached process identity; futexes, robust lists,
            rseq, TLS; vDSO/vvar time mappings; timers, epoll/poll, pending
-           signals, pending async I/O; ASLR / address-space assumptions (shared
-           base ⇒ shared layout; inject new per-agent randomness post-restore,
-           RHAZARD-1); page protections and mapping attributes (R/W/X, guard
+           signals, pending async I/O; ASLR / address-space layout: unlike the
+           other items here it CANNOT be refreshed for a restored process, whose existing
+           mappings already have pointers baked into the heap, so only FUTURE allocations
+           and seeds take new per-agent randomness (RHAZARD-1) and an identical shared-base
+           layout is an ACCEPTED RESIDUAL (RHAZARD-8), not a refreshable item; page protections and mapping attributes (R/W/X, guard
            pages, no-access ranges, shared vs private) reestablished per MLAYOUT-5;
            seccomp, namespaces, cgroups, credentials, capabilities;
            language-runtime state (Go scheduler/netpoller, JVM safepoints, Python
@@ -1201,7 +1212,10 @@ RHAZARD-8: Empirically (benchmarking/rhz.go, gVisor systrap), across clones
            ASLR layout are IDENTICAL across clones. boot_id MUST be regenerated per
            clone where workloads key on boot/machine identity; ASLR uniformity across
            a clone set is a residual mitigated only by trust/cache-domain boundaries
-           absent cooperative re-randomization (RHAZARD-7). This bounds the
+           absent cooperative re-randomization (RHAZARD-7); it cannot be re-randomized for an
+           already-restored process, so one leaked pointer or one working exploit offset
+           generalizes across every clone of that base (an accepted residual of
+           shared-base restore). This bounds the
            non-cooperative tenet: a non-cooperating agent is clone-safe only for
            kernel-CSPRNG randomness and clocks (RHAZARD-1).
 
@@ -2797,11 +2811,16 @@ ENC-3: Opaque runtime-native objects, the base runtime_state blob (§15.5) and t
 
 15.3 Terrapin profile conformance vectors
 
-CROSS-CONFIRMED (ENC-CONF-2 satisfied): every vector below was reproduced
+CROSS-CONFIRMED (ENC-CONF-2 substantially discharged): every vector below was reproduced
 byte-for-byte by two independent v0.3 implementations, terrapin-rs (Rust,
 streaming/parallel) and terrapin-go (Go, in-memory plus a streaming reader for the
-128 GiB cases), and both agree with these values. The two have independent canonical
-manifest encoders, so this also rules out silent manifest divergence.
+128 GiB cases), and by a THIRD independent clean-room oracle written from the §2.2/§15.3
+text alone with no reference code (which also confirmed the SPARSE-8 recurrence: that
+Z_1 = G(Z_0 repeated 65536 times) equals the 128 GiB zero tree root). Three independent
+canonical manifest encoders agreeing rules out silent manifest divergence and is evidence
+the manifest grammar is unambiguous. ENC-CONF-2 is NOT fully satisfied until the vector
+set also includes the partial-tail zero span required in SPARSE-8 (a zero span not a whole
+multiple of the level-1 span).
 
   Constants:
     G(empty)                = 473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813
@@ -2856,8 +2875,9 @@ the bare tree root presented as the identifier.
 
 ENC-SR-1: All fields MUST be present in this order; "none" is the explicit length-0
           value, never omitted (OBJ-5, SR-1). A digest field's length MUST be
-          exactly 0 or 32; any other length MUST reject. Unknown run_mode MUST
-          reject. createdNsec >= 1e9 MUST reject.
+          exactly 0 or 32; any other length MUST reject. run_mode MUST be exactly one byte
+          (any other length MUST reject) and a known value (unknown MUST reject).
+          createdNsec >= 1e9 MUST reject.
 ENC-SR-2: Exactly the §6.2/SR-4 conditional rules apply: if memory or filesystem
           is non-none, workload MUST be non-none; if memory is non-none, sandbox_pin
           MUST be non-none. When memory is non-none, runtime is normally non-none
@@ -2968,7 +2988,11 @@ ENC-ML-2: The base memory snapshot is guest-address-linear (MLAYOUT-1): for a
           length MUST equal committedEnd. Because the MEM-1 identity does not
           distinguish states 2 and 3 (both zeros), this signed layout is the sole
           authority for that distinction (MEM-5); any other objectOffset MUST
-          reject.
+          reject. In v1 objectOffset is fully derivable from state and guestStart (it is
+          redundant); it is retained as an explicit committed field to reserve the
+          encoding for future non-identity-mapped layouts, where the base object need not
+          be guest-address-linear, so v1 pins it to the derivable value rather than
+          dropping it and forcing a breaking encoding change later.
 
 ⸻
 
@@ -3037,6 +3061,14 @@ ENC-MD-5: Source selection MUST be canonical (one encoding per effective page st
           unchanged from an ancestor. A verifier MUST reject structurally detectable
           violations (ENC-MD-2) and, where it has the base, a redundant source==3/4
           for a base-identical page.
+ENC-MD-6: base_ref MUST equal the base_memory field of the base descriptor named by the
+          same State Root (§15.4 base; §15.5). Restore MUST reject a memory delta whose
+          base_ref does not match, EVEN IF base_ref names another validly Terrapin-
+          verified base memory object: source==3 (base) pages, and the copy-on-write
+          composition of the remaining pages, resolve against base_memory, so a mismatched
+          base_ref would silently compose the wrong bytes without tripping any other rule.
+          base_ref is bound to the signed base descriptor (§2.5), not to any verified
+          object that merely parses.
 
 ⸻
 
@@ -3107,7 +3139,8 @@ in docs/workload-identity-expansion.md.
     name (varbytes); image (varbytes);
     cmdCount u64 + each (varbytes, declared order);
     argsCount u64 + each (varbytes, declared order);
-    envCount u64 + each (name varbytes; value varbytes), SORTED by name then value;
+    envCount u64 + each (name varbytes; value varbytes), SORTED by name (unique by
+    name, ENC-WI-1, so no value tiebreak is reachable);
     working_dir (varbytes);
     security (SecurityContext sub-record);
     capAddCount u64 + caps (varbytes, SORTED, unique);
@@ -3189,7 +3222,9 @@ ENC-CONF-2: A reference oracle (a non-production tool sharing the Terrapin core)
             non-zero inlineCount, which are reserved in v1, LLAY1-11); a memory-layout
             (LLML1) case with a mapped-data region at a HIGH guest address preceded by
             a very large unmapped/no-access zero span (to catch tree-height and
-            off-by-one bugs in the virtual zero-subtree proof rules, SPARSE-8), plus a
+            off-by-one bugs in the virtual zero-subtree proof rules, SPARSE-8), AND a
+            partial-tail case whose zero span is not a whole multiple of the level-1 span
+            (its final level-1 digest is G over a shorter concatenation, not Z_1), plus a
             mapped-zero vs unmapped state-mismatch reject case; the per-level all-zero
             subtree roots Z_0..Z_L the 2 MiB profile uses (SPARSE-8 mandates pinning
             these so virtual proof blocks are byte-identical across implementations);
@@ -3415,10 +3450,6 @@ isolated cluster until SCOPE-1 is supplied.
 
 ⸻
 
-End of specification.
-
-⸻
-
 17. Glossary
 
 Canonical terms (the only terms this document uses for stored state and lifecycle):
@@ -3629,3 +3660,7 @@ Retired terms (do not use): chunk, chunk map, artifact, plane manifest, opaque
 checkpoint, checkpoint plane, checkpoint manifest, golden memory (as an object),
 state-root-sha256 (as a separate scheme), "co-design"/team references for runtime
 changes (state required runtime capabilities technically, §11).
+
+⸻
+
+End of specification.
