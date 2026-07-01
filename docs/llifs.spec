@@ -3275,8 +3275,47 @@ known-zero-without-fetch, has been demonstrated on Linux aarch64 (see
 benchmarking/density_smoke.c and benchmarking/density-prototype-findings.md):
 8 procs over a 256 MiB base measured rss=256 MiB but pss~=base/8, a write stayed
 private to the writer, and absent pages populated from the base (never zero). This
-de-risks GVISOR-3; the gVisor MemoryFile change itself and the verified-in-loop
-N-sandbox run through runsc remain.
+de-risks GVISOR-3 at the kernel level; the gVisor MemoryFile change and the
+verified-in-loop N-sandbox run through runsc are now built and measured (below).
+
+Validated (runsc/gVisor level, 2026-07). The GVISOR-3 MemoryFile base/delta change
+and the checkpoint/restore plumbing are built (benchmarking/gvisor3-s1.pgalloc.patch,
+c1-restore-plumbing.patch, c1b-checkpoint-plumbing.patch) and run through the real
+runsc CLI on a GCE nested-virtualization host with /dev/kvm; full results in
+benchmarking/density-prototype-findings.md §§13a-13f and the field report
+docs/blog-shared-base-memory.md. Against the acceptance test:
+  - Shared COW base restore composes END-TO-END on KVM (the guest resumes over the
+    base with memory intact) and FAILS on systrap (the stub maps the per-sandbox
+    memfd, not the sentry overlay). This confirms the GVISOR-6 page-provider
+    distinction and platform_mode (§15.5) empirically: the overlay is guest-correct
+    only where MapFile consumes MapInternal (KVM); systrap needs KSM on the memfds
+    (RHAZARD-8).
+  - Physical sharing (COW-1/COW-3) measured through runsc: N=8 real sandboxes over
+    one 256 MiB base gave sum-Rss/sum-Pss = 5.7x. Write-private (no bleed),
+    absent-not-zero (COW-6/6a), and known-zero-without-fetch (COW-6b) are covered by
+    the verify_share (eager) and lazy_verify (uffd + CAS) harnesses, where a tampered
+    block is rejected at the fault and never exposed (MVERIFY-2, READ-2, PEER-1).
+    These are proven across the harness suite, not yet in one integrated
+    verified-CAS-in-runsc process (see remaining, below).
+  - runsc checkpoint --shared-base emits a base.img plus a delta-only checkpoint
+    (empty pages file for a freshly warmed clone), so a warm pool costs one base plus
+    a ~248 KiB per-agent state delta, not a full ~81 MiB checkpoint each.
+  - The density CEILING is the per-sandbox floor, not the base: ~20 MiB/sandbox
+    (sentry + gofer, ~half live Go runtime) is unshareable. A real google-adk agent
+    over an 80 MiB base flattened ~2.9x, close to the floor-limited ceiling
+    (base+floor)/(base/N+floor) = 3.3x; ~300 sandboxes fit on a 15 GiB / 4-core node.
+    Density pays off only when the shared resident base is large relative to the
+    floor (§6.7).
+  - Adjacent, and platform-independent (informative): restore skips cold start. A
+    google-adk agent cold-starts in ~11.4 s / 7.1 s CPU and restores in ~0.6 s;
+    because this is checkpoint/restore and not the overlay, it holds on systrap too
+    (~4.05 s -> ~0.18 s) and is a portable win independent of the KVM-only density
+    gate (§7.6 TTR).
+
+Remaining for the gate: the INTEGRATED rungs 1-3 path (verified per-block lazy fault
+through the CAS-backed page provider under a shared MemoryFile in one runsc process),
+and systrap density via KSM. The mechanism, the platform boundary, the flatten
+magnitude, and the latency are now measured.
 
 Implementation surface (keep Phase 1 ruthlessly focused on four interfaces; defer
 fork, yield, P2P, scheduler warmth, fleet GC, and native backends until physical

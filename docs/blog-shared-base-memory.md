@@ -525,6 +525,14 @@ resident base is large enough.
 The result to build around first is broader: do not cold-start near-identical agents.
 Snapshot them after initialization and restore them when needed. Skipping startup is the portable win; shared guest memory is the KVM bonus.
 
+There is one more door this opens. The property that makes a shared base safe,
+verify-before-expose, is also what lets the base travel. A content-addressed,
+cryptographically verified block can be fetched from any untrusted peer, mirror, or cache and
+re-checked before the guest sees it, so nothing on the wire has to be trusted. The local win
+(one verified base resident per node) and the fleet win (distributing that base over
+untrusted transport) are the same mechanism at two radii, and that distributed verified store
+is the next thing to build.
+
 ## Measurement details
 
 Audit material for the experiments above, kept out of the main narrative.
