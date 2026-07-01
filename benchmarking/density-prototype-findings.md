@@ -530,6 +530,38 @@ noted in sec 9's ~10x node vs ~31x guest-plane split), but it is the real number
 operator would see. Combined with 13a (correctness) this is the complete validation:
 checkpoint/restore base-sharing works and flattens memory on a live KVM guest.
 
+### 13c. Density ceiling on the KVM box (n2-standard-4: 4 vCPU, 15987 MiB)
+
+Escalated N real runsc KVM sandboxes over one shared 128 MiB base (light warmed agent:
+sample checksum + tick/sec), measuring at each step. ALL clones ran correctly at every N
+(ticking_ok == running):
+
+```
+N    sumRss    sumPss   MemAvail   load1(4vCPU)
+32   2414 MiB   659 MiB  13934 MiB   0.5
+64   4835 MiB  1289 MiB  12396 MiB   0.3
+128  9682 MiB  2514 MiB   9357 MiB   7.1
+200 15125 MiB  3884 MiB   5936 MiB  16.6
+300 22698 MiB  5797 MiB    983 MiB  29    <- memory floor; guard stopped here
+```
+
+Findings:
+- MEMORY ceiling ~300 on 15 GiB (MemAvail hit ~1 GiB at N=300; would OOM just past).
+- Per-sandbox cost has TWO parts: the sentry guest-RAM Pss marginal is ~19 MiB/clone
+  (base shared once), but total system memory drops ~47 MiB/sandbox because each sandbox
+  is sentry + GOFER + monitor -- the gofer/monitor (~28 MiB) is a SECOND per-sandbox floor
+  beyond the sentry (Pss captures only the sentry/guest-RAM view). N ~= (RAM - base) / ~47.
+- CPU is the softer limit: load stays <1 to N=64, ~7 at N=128 (~1.8x/vCPU), ~17 at N=200,
+  ~29 at N=300. So "comfortable" (memory headroom + load ~2-4x/vCPU) is ~150-200 here;
+  ~300 is the hard memory ceiling and still functional.
+- Sentry-mapping flatten at N=300: sumRss/sumPss = 22698/5797 = 3.9x. Modest because the
+  base (128 MiB) is small relative to the ~47 MiB/sandbox floor; a LARGER warm base (real
+  model/runtime, GiBs) makes the base dominate and the flatten much bigger. Density scales
+  as N = (RAM - base)/(gofer+sentry overhead + delta), and the flatten as
+  (base+overhead)/overhead -- both improve with a bigger shared base.
+- Without sharing on this box: each clone needs base(128)+overhead(~47)=~175 MiB -> ~85
+  fit; with sharing ~300 -> ~3.5x more sandboxes for this small base.
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
