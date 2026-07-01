@@ -505,6 +505,31 @@ through kernel.SaveTo, to produce a delta-only checkpoint) plus base-image produ
 C1b. That is now fully de-risked: the hard question (does the overlay reach the guest on
 KVM?) is answered YES.
 
+### 13b. C1b DONE: runsc-observable flatten on a live KVM guest (5.69x, N=8)
+
+Built the checkpoint-side base plumbing (c1b-checkpoint-plumbing.patch: cmd/checkpoint.go
+--shared-base flag -> sandbox base.img -> control.SaveOpts -> state.SaveOpts -> kernel
+SaveTo/saveMemoryFiles ExportLinearBase + delta-only SaveTo, main-MF only). `runsc
+checkpoint --shared-base` now produces a base.img plus a DELTA-ONLY checkpoint. Ran the
+full pipeline on the GCE KVM instance with a touch-all cr_workload (WARM_MB=256, so the
+whole base faults resident and the sharing shows, not just per-sentry overhead):
+
+```
+checkpoint --shared-base:  base.img=257 MiB   pages.img=0 bytes (all base-backed, delta=0)
+restore 8 clones over base (--platform=kvm): all tick=28, checksum=ok (256 MiB touched)
+  sum sentry Rss = 2398 MiB (would-be no-sharing)   sum sentry Pss = 421 MiB (shared)
+  FLATTEN = 5.69x  through the real runsc CLI on a live KVM guest
+```
+
+So N=8 real runsc sandboxes on KVM share one 256 MiB base: ~2.4 GiB of would-be private
+guest RAM collapses to ~0.42 GiB resident. This is the end-to-end, guest-observable
+flatten -- checkpoint (--shared-base) -> delta-only image -> N restores over the shared
+base -> physical sharing measured at the host across the sentry processes. It is lower
+than the pgalloc-layer ideal (per-sentry overhead ~20-45 MiB is the density FLOOR, as
+noted in sec 9's ~10x node vs ~31x guest-plane split), but it is the real number an
+operator would see. Combined with 13a (correctness) this is the complete validation:
+checkpoint/restore base-sharing works and flattens memory on a live KVM guest.
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified

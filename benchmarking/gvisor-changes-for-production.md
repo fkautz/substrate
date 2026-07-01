@@ -303,6 +303,15 @@ F9. [found][CRITICAL] The base overlay must live at the DataFD/MapFile layer (th
     the guest on systrap. This empirically closes F9: the overlay reaches the guest on
     KVM. Remaining for a runsc-observable flatten MAGNITUDE = checkpoint-side base
     plumbing (C1b), now de-risked (see density-prototype-findings sec 13a).
+    C1b DONE (2026-07-01): checkpoint-side base plumbing built (c1b-checkpoint-plumbing.patch:
+    runsc checkpoint --shared-base -> sandbox base.img -> control/state SaveOpts -> kernel
+    saveMemoryFiles ExportLinearBase + delta-only SaveTo for the main MF). `runsc checkpoint
+    --shared-base` produces a base.img + delta-only checkpoint (pages.img=0 when delta=0).
+    N=8 real runsc sandboxes restored over the shared base on --platform=kvm (touch-all
+    256 MiB workload) all run correctly (checksum=ok) and share physically: sum sentry
+    Rss=2398 MiB vs sum Pss=421 MiB -> 5.69x flatten through the real runsc CLI on a live
+    KVM guest (per-sentry overhead ~20-45 MiB is the density floor). This is the complete
+    end-to-end validation of GVISOR-3 on the production KVM platform.
 
 F8. [found][CORRECTED] LoadFrom bypasses the extendChunksLocked base overlay. On
     restore, LoadFrom does its OWN single mmap of f.file (MAP_SHARED over the whole
