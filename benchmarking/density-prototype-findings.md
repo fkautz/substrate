@@ -562,6 +562,45 @@ Findings:
 - Without sharing on this box: each clone needs base(128)+overhead(~47)=~175 MiB -> ~85
   fit; with sharing ~300 -> ~3.5x more sandboxes for this small base.
 
+### 13d. Real Python/ADK agent: per-sandbox floor composition + the LATENCY win (2026-07-01)
+
+Ran a real google-adk 2.3.0 agent (Python 3.12) with a MOCK LLM (custom BaseLlm, no
+network) under runsc/KVM, checkpoint --shared-base + restore N. Live Python + asyncio +
+grpc checkpoint/restores correctly (clones resume + keep serving).
+
+PER-SANDBOX FLOOR (measured with a tiny guest, so it is nearly all overhead):
+  sentry: Pss=24M, of which Anon(Go heap/stacks)=8M, private(marginal)=17M, binary=19M SHARED
+  gofer:  Pss=10M, Anon(Go)=3M, private=3M, binary=18M SHARED
+  -> marginal per sandbox ~= 20M (17 sentry + 3 gofer); ~11M of that is live Go runtime
+     across TWO Go processes (sentry + gofer). The ~37M runsc binary is SharedClean (mapped
+     once for all sandboxes), so Go's big binary is a one-time cost, not marginal.
+  NOT GC-tunable: wiring debug.SetGCPercent(20) into the sentry boot changed nothing (idle
+  sentry has no garbage; the 8M is structural -- 13 OS threads + goroutine stacks + runtime
+  arenas). runsc also strips GOGC/GOMEMLIMIT from the sentry env. Sentry is ~277k LOC (191k
+  pkg/sentry + 86k netstack), 645 syscalls -- irreducible. Gofer subsystem ~19.6k LOC (lisafs
+  7.4k + fsimpl/gofer 10k + fsgofer 1.4k + cmd 0.6k); process itself ~2k; directfs (default)
+  already sidelines it at runtime but the process persists. A Rust rewrite would shave ~4M of
+  the ~17M sentry floor (the runtime slice) and nothing of the kernel working set -- not worth
+  a multi-year rewrite; the tractable floor win is reaping the directfs gofer (~3M).
+
+FLATTEN with the real ADK base: base.img=80-81M (committed Python+ADK guest RAM), delta=0.
+  N=8: sumRss=721M, sumPss=250M -> 2.88x. Per-clone Python COW delta only ~4M (CPython 3.12
+  IMMORTAL OBJECTS keep refcount churn from dirtying shared pages -- the mechanism is fine).
+  Padding the agent to a 1.1G warm bytearray did NOT raise the flatten: untouched-after-restore
+  base is never faulted resident, so it costs 0 RAM and there is nothing to share. LESSON: the
+  flatten applies only to the RESIDENT HOT working set clones actually touch, not allocated size.
+
+THE LATENCY WIN (this is the strongest result for agent FaaS):
+  COLD START (runsc run -> agent serving): wall=11.4s  cpu=7.1s   (Python+ADK import/init)
+  RESTORE single (runsc restore -> serving): wall=0.47s  cpu=0.51s
+  RESTORE 8 concurrent: all 8 serving within 1.87s
+  -> restore is ~24x faster wall and ~14x less CPU than cold start; 8 agents serve in <2s vs
+  ~57s cumulative cold-start CPU. Restore is I/O (map the image, base shared via page cache,
+  delta~0), not CPU. This is what makes scale-to-zero + burst scale-up viable, and it grows
+  with agent init cost: a real agent that loads models/warms caches cold-starts in tens of
+  seconds to minutes, while restore stays ~sub-second. Density is workload-dependent; the
+  cold-start elimination is a robust, large win regardless of base size.
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
