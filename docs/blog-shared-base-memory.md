@@ -552,5 +552,6 @@ node. Capturing a base from a live sandbox runs at ~3.7 GB/s.
 
 **Environment.** Density and latency runs were on a GCE `n2-standard-4` (four vCPUs, ~15 GiB,
 nested virtualization enabled for real `/dev/kvm`); gVisor built from source with the base/delta
-patches. The nested-KVM host mattered: gVisor's KVM backend crashed the machine under
-Apple-silicon and VMware nesting, and only GCE's Linux KVM-backed nested virtualization ran it cleanly.
+patches. The nested-KVM host mattered: an Apple-silicon setup exposed no usable `/dev/kvm` at all,
+VMware nesting crashed when the KVM backend ran, and only GCE's Linux KVM-backed nested
+virtualization ran it cleanly.
