@@ -27,20 +27,20 @@ copy of guest RAM. The baseline, measured directly, was three clones of a 512 Mi
 HTTP server restored from one checkpoint:
 
 ```
-3 × ~557 MiB sentry RSS = 1674 MiB
+3 clones = 1674 MiB sentry RSS   (~558 MiB each)
 ```
 
 Each number is the resident memory (RSS) of a runsc *sentry*, the per-sandbox userspace
 kernel process. That is ~1× base *per clone*, and at a thousand clones RAM is the wall long
 before CPU is.
 
-The hypothesis is the obvious one: most of that 557 MiB is *identical* across clones (the
+The hypothesis is the obvious one: most of that 558 MiB is *identical* across clones (the
 warmed base), and only a small slice differs per clone (the delta). If the shared portion is
 large and the per-clone delta is small, the economics change from one full RAM copy per
 clone to one base plus N deltas. Keep one physical copy of the base, share it copy-on-write,
 and density becomes **delta-bound, not base-bound**.
 
-Call the improvement factor the **flatten**: the ratio of would-be private resident
+Call the improvement factor the **flatten** (a sharing factor): the ratio of would-be private resident
 memory (every clone a full copy) to shared physical memory (one base plus the per-clone
 deltas). A 10× flatten means the clones consume roughly one-tenth the physical RAM they
 would as full copies.
@@ -89,7 +89,8 @@ gVisor backs guest RAM with a per-sandbox `memfd` (the `MemoryFile` in
 `pkg/sentry/pgalloc`), and that memfd turns out to be laid out linearly in guest-physical
 order. So a running sandbox's guest memory can be snapshotted just by reading
 `/proc/<sentry>/fd/<memfd>` at two points in time and diffing it page by page, with no
-gVisor rebuild.
+gVisor rebuild. This leans on an internal gVisor layout invariant, the guest-physical-linear
+memfd, rather than a stable interface, but it holds for the measurement.
 
 A 512 MiB warmed Go HTTP server under runsc, snapshotted, driven through **5000 real
 requests**, and snapshotted again:
@@ -188,8 +189,10 @@ sandbox itself: a node-local cache, a peer, an object store. A base page should 
 into a sandbox unless it is certain to be the page it claims to be. The rule to enforce is
 **verify-before-expose**: no byte reaches the guest without being checked first.
 
-The check is content-addressing, using Terrapin. Terrapin gives the whole base image a
-single dataset identity, `terrapin-sha256:<digest>`.
+The check is content-addressing, using Terrapin (v0.3). Terrapin gives the whole base image a
+single dataset identity, `terrapin-sha256:<digest>`. The scheme is cross-confirmed by two
+independent v0.3 implementations, [terrapin-go](https://github.com/fkautz/terrapin-go) and
+terrapin-rs.
 
 The base is split into 2 MiB blocks, exactly 2,097,152 bytes each, with the final block
 allowed to be smaller. Each leaf is hashed with GitOID SHA-256, the Git blob
@@ -229,8 +232,11 @@ terminates at the authenticated ID and the sealed base, not at the bytes alone.
 
 Both paths were built and tested: an eager path (verify the whole base up front, then share)
 and a lazy/remote path (fetch, verify, and install each absent block on first access, with
-known-zero blocks (those the metadata marks as all zero) installed via `UFFDIO_ZEROPAGE`
-and no fetch). Verification did not
+known-zero blocks installed via `UFFDIO_ZEROPAGE` with no fetch). Crucially, "known-zero" is
+not a hint from side metadata, which would reopen the exact tamper hole verify-before-expose
+closes; a block is known zero because its *verified* leaf hash equals the fixed constant for a
+2 MiB block of zeros, so the zero-ness is authenticated by the same tree as every other block.
+Verification did not
 materially change the measured resident-memory flatten in these tests, because it gates trust
 rather than adding resident pages. And it holds under attack: with one block deliberately
 corrupted in the store, the flipped byte changes the leaf hash, so recomputation no longer
@@ -325,7 +331,10 @@ mapping the memfd directly, so the overlay is invisible to it. Cross-sandbox bas
 intra-sandbox sentry/stub coherence, and per-page base/delta composition are not all
 available from plain mmap on systrap; the realistic options there are KSM (let the host dedup
 identical pages across sandboxes, which is simple but opportunistic and content-blind) or a
-deeper coherent shared-base plus delta-overlay mechanism.
+deeper coherent shared-base plus delta-overlay mechanism. KSM also carries a security cost the
+explicit design avoids: cross-tenant page deduplication is a documented side channel, since an
+attacker can infer another tenant's memory contents from merge timing, whereas sharing a
+known, public base leaks nothing, because there is nothing secret to discover.
 
 KVM is different. Its `MapFile` maps the guest from `MapInternal`, the sentry mapping the base
 overlay modifies:
@@ -449,16 +458,18 @@ had if it had never stopped.
 
 *Is it cheap to park?* Checkpointing takes 0.11 seconds, and with a shared base each parked
 agent costs about 248 KiB (its kernel state plus a near-zero delta) instead of the ~81 MiB of
-a full checkpoint. A pool of ten thousand parked agents is about 2.5 GiB at ~248 KiB each,
-instead of about 810 GiB at ~81 MiB each: a couple of gigabytes rather than most of a
-terabyte.
+a full checkpoint. A pool of ten thousand parked agents is about 2.5 GiB of checkpoint storage
+at ~248 KiB each (plus the one-time ~81 MiB base image), instead of about 790 GiB at ~81 MiB
+each: a couple of gigabytes rather than most of a terabyte.
 
 The caveat is burst. A single restore is sub-second, but fifty at once on four cores take
 about 18 seconds and a hundred take forty-plus, because each restore plus its first request is
-roughly 1.5 seconds of CPU and they contend for the cores. Restore is not instant scale-up. It
-is about four times cheaper per start than a cold start, at every scale, which is the narrower
-and more defensible claim: provision cores for the burst rate, and each start costs a quarter
-of what it did.
+roughly 1.5 seconds of CPU and they contend for the cores. Restore is not instant scale-up.
+The two CPU figures are not in tension: a single uncontended restore is about 0.5 s of CPU,
+roughly fourteen times less than a cold start's 7.1 s, but the number that matters under load
+counts each start's first-request fault-in too (about 1.5 s of CPU), and that is where the
+roughly four-times-cheaper figure comes from. It is the narrower and more defensible claim:
+provision cores for the burst rate, and each start costs a fraction of what it did.
 
 ## The part that runs anywhere
 
@@ -518,6 +529,10 @@ cheaper on both platforms tested.
 - **Base-aware accounting.** Resident base pages should be counted once per node, not once per
   sandbox.
 
+The gVisor patches (the base/delta `pgalloc` change plus the checkpoint and restore plumbing)
+and the full measurement harness live in the
+[Substrate repository](https://github.com/agent-substrate/substrate).
+
 Base sharing works where the platform consumes the sentry's composed memory view: KVM does,
 systrap does not. That makes memory sharing a real density bonus on KVM when the active
 resident base is large enough.
@@ -542,10 +557,12 @@ pss=137 MiB, N=64 gives pss=16 MiB (= base/64). PSS tracks base/N as expected.
 
 **Eager verification.** Verifying the whole base against the manifest, then sharing: 35 ms per
 64 MiB (~1.9 GB/s), paid once per node, independent of clone count. Flatten with verification
-in the loop: N=16 → 8.0×, N=32 → 15.6×.
+in the loop: N=16 → 8.0×, N=32 → 15.6×. (These verification-path runs use a different
+base/delta mix than the flatten table in the main text, so their per-N figures are not
+directly comparable to it; the same applies to the lazy numbers below.)
 
 **Lazy / remote verification.** A userfaultfd MISSING handler over a node-shared backing,
-16 blocks with one known-zero and one deliberately tampered:
+16 blocks with one known-zero (recognized by its verified zero-constant leaf hash) and one deliberately tampered:
 
 ```
 fetches=15  verifies=15  zero-installs=1  rejects=1
