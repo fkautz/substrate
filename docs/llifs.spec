@@ -756,9 +756,12 @@ SPARSE-8: Virtual zero applies to PROOF blocks too, not just data. A hash-file/p
           ENC-CONF-2 MUST pin the zero-subtree root for each level the profile uses,
           so independent implementations cannot invent divergent shortcut rules; a
           conformance vector MUST exercise a high-address mapped-data region behind a
-          large zero span, INCLUDING a partial-tail case whose zero span is not a whole
-          multiple of the level-1 zero span, so its final level-1 hash-file digest is G
-          over a shorter concatenation than Z_1, never Z_1 itself.
+          large zero span, INCLUDING a partial-tail case that exercises BOTH tail
+          phenomena: a final DATA leaf shorter than 2 MiB (its leaf digest is G over
+          shorter zeros, not Z_0) AND a final level-1 hash-file block with fewer than the
+          full fanout of entries (its digest is G over a shorter concatenation, not Z_1).
+          One span covers both, e.g. 130 GiB + 1 byte of zeros ahead of the mapped-data
+          region.
 
 Small files:
 
@@ -1195,16 +1198,16 @@ RHAZARD-7: Before HAZARDS_CLEARED for multi-tenant restore, each of the followin
            MUST be refreshed/invalidated or asserted not-applicable by signed
            policy: PID/TID and cached process identity; futexes, robust lists,
            rseq, TLS; vDSO/vvar time mappings; timers, epoll/poll, pending
-           signals, pending async I/O; ASLR / address-space layout: unlike the
-           other items here it CANNOT be refreshed for a restored process, whose existing
-           mappings already have pointers baked into the heap, so only FUTURE allocations
-           and seeds take new per-agent randomness (RHAZARD-1) and an identical shared-base
-           layout is an ACCEPTED RESIDUAL (RHAZARD-8), not a refreshable item; page protections and mapping attributes (R/W/X, guard
-           pages, no-access ranges, shared vs private) reestablished per MLAYOUT-5;
+           signals, pending async I/O; page protections and mapping attributes (R/W/X,
+           guard pages, no-access ranges, shared vs private) reestablished per
+           MLAYOUT-5;
            seccomp, namespaces, cgroups, credentials, capabilities;
            language-runtime state (Go scheduler/netpoller, JVM safepoints, Python
            hash seed, OpenSSL/BoringSSL DRBG reseed); capture-time secret scanning
-           or a no-secrets-before-capture guarantee (RHAZARD-4).
+           or a no-secrets-before-capture guarantee (RHAZARD-4). Address-space layout is
+           deliberately NOT on this checklist: it cannot be refreshed for a restored
+           process (existing mappings have pointers baked into the heap) and is governed
+           as an accepted residual by RHAZARD-8.
 RHAZARD-8: Empirically (benchmarking/rhz.go, gVisor systrap), across clones
            restored from one checkpoint the runtime ALREADY refreshes kernel entropy
            (getrandom and /dev/urandom give distinct per-clone bytes) and advances
@@ -2818,7 +2821,9 @@ streaming/parallel) and terrapin-go (Go, in-memory plus a streaming reader for t
 text alone with no reference code (which also confirmed the SPARSE-8 recurrence: that
 Z_1 = G(Z_0 repeated 65536 times) equals the 128 GiB zero tree root). Three independent
 canonical manifest encoders agreeing rules out silent manifest divergence and is evidence
-the manifest grammar is unambiguous. ENC-CONF-2 is NOT fully satisfied until the vector
+the manifest grammar is unambiguous (this is the encoder/identifier direction; the §15.3
+manifest accept/reject matrix is a separate conformance surface the clean-room oracle did
+not exercise). ENC-CONF-2 is NOT fully satisfied until the vector
 set also includes the partial-tail zero span required in SPARSE-8 (a zero span not a whole
 multiple of the level-1 span).
 
@@ -3223,9 +3228,10 @@ ENC-CONF-2: A reference oracle (a non-production tool sharing the Terrapin core)
             (LLML1) case with a mapped-data region at a HIGH guest address preceded by
             a very large unmapped/no-access zero span (to catch tree-height and
             off-by-one bugs in the virtual zero-subtree proof rules, SPARSE-8), AND a
-            partial-tail case whose zero span is not a whole multiple of the level-1 span
-            (its final level-1 digest is G over a shorter concatenation, not Z_1), plus a
-            mapped-zero vs unmapped state-mismatch reject case; the per-level all-zero
+            partial-tail case exercising both a short final data leaf (G over shorter
+            zeros, not Z_0) and a short final level-1 block (G over a shorter
+            concatenation, not Z_1), e.g. a 130 GiB + 1 byte zero span, plus a mapped-zero
+            vs unmapped state-mismatch reject case; the per-level all-zero
             subtree roots Z_0..Z_L the 2 MiB profile uses (SPARSE-8 mandates pinning
             these so virtual proof blocks are byte-identical across implementations);
             an LLSR1 round trip WITH a non-none runtime delta present, and an LLBD1
