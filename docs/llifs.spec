@@ -1,6 +1,6 @@
 LLIFS Specification
 
-Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). A third hardening pass then defined the RDELTA-1 no-runtime-state exception (a signed base-descriptor field, ENC-BD-5, whose semantics are a resume-time guarantee for any later memory-persisting snapshot, not merely a property of the base restore point) and its verifier step, fixed the opaque-runtime-object framing convention (ENC-3: base runtime_state and the runtime delta are raw, unframed; all other encodings are framed), forbade the runtime delta from carrying memory/filesystem bytes (ENC-RD-1), pinned the virtual zero-subtree derivation recurrence (SPARSE-8), split runtime-delta observability (OBS-9), and added the four-interface Phase-1 implementation surface (§16.1). Phase 1 prototyping is green-lit from this draft. The §15.3 Terrapin vectors are now CROSS-CONFIRMED by three independent v0.3 oracles (terrapin-rs, terrapin-go, and a clean-room oracle written from the §2.2/§15.3 text alone, which also validated the SPARSE-8 Z_1 recurrence), substantially discharging ENC-CONF-2; a partial-tail zero-span vector (a zero span not a whole multiple of the level-1 span) remains to add before freeze (§15.3); per-level zero-subtree roots (SPARSE-8) are pinned. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): runtime-delta implementation proof on a real gVisor hibernate/resume path; and grow atelet.WorkloadSpec (and ateom's reduced Container) to supply the full LLWI1 workload identity (docs/workload-identity-expansion.md, ENC-WI-1) - LLWI1 is the target identity and is deliberately NOT pared to the current proto, since a workload-identity mismatch is a restore-safety bug.
+Status: Draft (v1.0-draft). All sections (§§1-17) drafted, section-reviewed, reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact), and revised against two external technical reviews: the first (memory byte model, proof-block taxonomy, delta self-containment, workload-identity breadth, yield semantics, local-CAS integrity, directfs, inline reserved in v1, the Phase-1 density-gate ladder); the second adding the per-agent runtime-state delta (DELTA-2R / RDELTA / LLRD1), virtual zero-subtree proof rules (SPARSE-8), startup-cohesion reserved in v1, an exact oci_image_digest form (ENC-BD-4), LLMD1 source-precedence (ENC-MD-5), a named compatibility verifier step (MATRIX-3), and the gVisor page-provider distinction (GVISOR-6). A third hardening pass then defined the RDELTA-1 no-runtime-state exception (a signed base-descriptor field, ENC-BD-5, whose semantics are a resume-time guarantee for any later memory-persisting snapshot, not merely a property of the base restore point) and its verifier step, fixed the opaque-runtime-object framing convention (ENC-3: base runtime_state and the runtime delta are raw, unframed; all other encodings are framed), forbade the runtime delta from carrying memory/filesystem bytes (ENC-RD-1), pinned the virtual zero-subtree derivation recurrence (SPARSE-8), split runtime-delta observability (OBS-9), and added the four-interface Phase-1 implementation surface (§16.1). Phase 1 prototyping is green-lit from this draft. The §15.3 Terrapin vectors are now CROSS-CONFIRMED by three independent v0.3 oracles (terrapin-rs, terrapin-go, and a clean-room oracle written from the §2.2/§15.3 text alone, which also validated the SPARSE-8 Z_1 recurrence), substantially discharging ENC-CONF-2; the required partial-tail vector (case (a), a 130 GiB + 1 pure-zero object) is now computed by the clean-room oracle (§15.3) and remains only to be reproduced by terrapin-rs/terrapin-go before freeze; per-level zero-subtree roots (SPARSE-8) are pinned. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): runtime-delta implementation proof on a real gVisor hibernate/resume path; and grow atelet.WorkloadSpec (and ateom's reduced Container) to supply the full LLWI1 workload identity (docs/workload-identity-expansion.md, ENC-WI-1) - LLWI1 is the target identity and is deliberately NOT pared to the current proto, since a workload-identity mismatch is a restore-safety bug.
 System: LLIFS (a verified, deduped, lazily-faulted state substrate for high-density agent FaaS).
 Primary target: gVisor (runsc) checkpoint/restore; Firecracker microVM next. One content-addressed, Terrapin-verified store delivers two state planes: a filesystem plane and a memory plane.
 External identity: OCI-compatible sha256.
@@ -745,7 +745,12 @@ SPARSE-8: Virtual zero applies to PROOF blocks too, not just data. A hash-file/p
           block (level >= 1) whose entries are fully determined by canonical zero
           subtrees MAY be represented virtually: it MUST NOT be stored or fetched, and
           MUST verify byte-identically to the materialized Terrapin hash-file block it
-          stands for. This is required for very large sparse objects (notably the
+          stands for. A PARTIALLY zero proof block (some but not all entries determined by
+          zero subtrees) is NOT virtual: it is materialized, but its zero entries MAY be
+          filled from the Z_0..Z_L constants entry-wise rather than fetched, and its block
+          digest MUST come out byte-identical to full materialization (the byte-identity
+          requirement above then applies unchanged). This is required for very large sparse
+          objects (notably the
           guest-address-linear memory image, MEM-1, where a high-address mapped-data
           block's proof siblings may be entirely zero subtrees): a verifier resolves
           such proof blocks from the zero constant (§2.2), never the network. The
@@ -756,12 +761,18 @@ SPARSE-8: Virtual zero applies to PROOF blocks too, not just data. A hash-file/p
           ENC-CONF-2 MUST pin the zero-subtree root for each level the profile uses,
           so independent implementations cannot invent divergent shortcut rules; a
           conformance vector MUST exercise a high-address mapped-data region behind a
-          large zero span, INCLUDING a partial-tail case that exercises BOTH tail
-          phenomena: a final DATA leaf shorter than 2 MiB (its leaf digest is G over
-          shorter zeros, not Z_0) AND a final level-1 hash-file block with fewer than the
-          full fanout of entries (its digest is G over a shorter concatenation, not Z_1).
-          One span covers both, e.g. 130 GiB + 1 byte of zeros ahead of the mapped-data
-          region.
+          large zero span. Two distinct tail phenomena must be covered, and because they
+          have INCOMPATIBLE placement they need SEPARATE vectors. The shorter-than-Z_0 and
+          shorter-than-Z_1 tails occur ONLY at the end of a PURE-zero object: a zero span
+          ahead of mapped data cannot produce them, because its boundary +1 byte lands in a
+          MIXED block that is materialized, never shortcut. So (a) a standalone §15.3
+          identifier vector of a pure all-zero object of 130 GiB + 1 byte covers those (its
+          final data leaf is G over 1 zero byte, not Z_0; its final level-1 block is G over
+          a shorter concatenation, not Z_1); and (b) the LLML1 case (a zero span ahead of
+          mapped data) instead exercises the mixed zero/data boundary block and, when the
+          total leaf count is not a whole multiple of the fanout, a PARTIALLY zero-derived
+          final level-1 proof block (some entries resolved from the Z_0 constant, some
+          computed from data leaves).
 
 Small files:
 
@@ -2823,9 +2834,10 @@ Z_1 = G(Z_0 repeated 65536 times) equals the 128 GiB zero tree root). Three inde
 canonical manifest encoders agreeing rules out silent manifest divergence and is evidence
 the manifest grammar is unambiguous (this is the encoder/identifier direction; the §15.3
 manifest accept/reject matrix is a separate conformance surface the clean-room oracle did
-not exercise). ENC-CONF-2 is NOT fully satisfied until the vector
-set also includes the partial-tail zero span required in SPARSE-8 (a zero span not a whole
-multiple of the level-1 span).
+not exercise). the partial-tail vector SPARSE-8
+requires (case (a), the 130 GiB + 1 pure-zero object) is now provided below, but from the
+clean-room oracle alone; ENC-CONF-2 is NOT fully satisfied until terrapin-rs and terrapin-go
+also reproduce it.
 
   Constants:
     G(empty)                = 473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813
@@ -2852,6 +2864,17 @@ multiple of the level-1 span).
   Z_1 is the tree root of the 128 GiB zero vector (G(manifest(137438953472, Z_1))
   equals the 128 GiB identifier above). Z_2 and Z_3 follow from the same node-hash
   recurrence over the agreed G; both oracles compute them identically.
+
+Pending cross-confirmation (clean-room oracle only, NOT yet reproduced by terrapin-rs or
+terrapin-go): the partial-tail vector (a) that SPARSE-8 requires, a PURE all-zero object of
+130 GiB + 1 byte (66561 blocks: a final 1-byte zero leaf, which is G over 1 zero byte and
+NOT Z_0; and a final level-1 block of 1025 entries, G over a shorter concatenation and NOT
+Z_1). The level-1 layer is two blocks: the first is exactly Z_1's preimage, the second is
+the 1025-entry partial block.
+    130 GiB + 1 zero (66561 blk) = 266a590c4206a2edfc2b2200b872b515cb35a2bd9dabb7556f6450c7419c84c3
+      (tree root = 9e7c35ee337543af728d04b5d16fba6d12f8f2c6b814925d214c1eefdf09cb16)
+  This is a clean-room-oracle value; the two production oracles MUST reproduce it before
+  ENC-CONF-2 is fully satisfied (§16 freeze).
 
 Manifest accept/reject (canonical Terrapin manifest, §2.2): a manifest MUST be
 ASCII, LF-terminated (including the last line), field order exactly terrapin,
@@ -3227,10 +3250,11 @@ ENC-CONF-2: A reference oracle (a non-production tool sharing the Terrapin core)
             non-zero inlineCount, which are reserved in v1, LLAY1-11); a memory-layout
             (LLML1) case with a mapped-data region at a HIGH guest address preceded by
             a very large unmapped/no-access zero span (to catch tree-height and
-            off-by-one bugs in the virtual zero-subtree proof rules, SPARSE-8), AND a
-            partial-tail case exercising both a short final data leaf (G over shorter
-            zeros, not Z_0) and a short final level-1 block (G over a shorter
-            concatenation, not Z_1), e.g. a 130 GiB + 1 byte zero span, plus a mapped-zero
+            off-by-one bugs in the virtual zero-subtree proof rules, SPARSE-8), which for the LLML1 case
+            exercises the mixed zero/data boundary block and a partially zero-derived final
+            level-1 proof block; the shorter-than-Z_0 and shorter-than-Z_1 tails are covered
+            separately by a standalone §15.3 pure-zero identifier vector of 130 GiB + 1
+            byte, plus a mapped-zero
             vs unmapped state-mismatch reject case; the per-level all-zero
             subtree roots Z_0..Z_L the 2 MiB profile uses (SPARSE-8 mandates pinning
             these so virtual proof blocks are byte-identical across implementations);
