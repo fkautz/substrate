@@ -251,9 +251,9 @@ restore WITH    base.img:  container stopped, no output       ❌  (workload cra
 ```
 
 The debug log showed the base image threaded through, the restore completing cleanly, every
-timer running to "end Restore," and then no tick from the workload. Restore succeeded; the
-guest was dead. The clean restore-without-base was the useful control here: it ruled out an
-ordinary restore regression and isolated the failure to the base-overlay path.
+timer running to "end Restore," and then nothing. No tick. Restore had succeeded flawlessly,
+and the guest was dead. The clean restore-without-base was the useful control here: it ruled
+out an ordinary restore regression and pinned the failure squarely on the base-overlay path.
 
 ## Who actually maps the guest's memory?
 
@@ -328,8 +328,9 @@ uses for guest memory, so they are valid coverage of the real target.
 
 ## Getting to real KVM
 
-That is where the story sat: the design lines up with KVM, but no `/dev/kvm` was available
-to prove it on a running guest. Finding hardware was the obvious unblock.
+That is where the story sat: the design lines up with KVM, but no `/dev/kvm` was anywhere
+in reach to prove it on a running guest. Leaving a load-bearing claim resting on a code read
+is an uncomfortable place to stop, so the next move was to go find hardware.
 
 The answer was Google Cloud. A GCE instance with nested virtualization enabled exposes a
 real `/dev/kvm`, and because Google's nested virtualization is genuine Linux KVM (the
@@ -392,10 +393,10 @@ far. On a 15 GiB, four-core box about 300 of these sandboxes fit before memory r
 flatten is real, but it pays off only when the shared resident base is large next to that
 floor, which for a small agent it is not.
 
-A lukewarm verdict on density would have been a reasonable place to stop. The same agent
-supplied the actual result instead.
+A lukewarm verdict on density would have been a reasonable place to stop. The same agent had
+a better result to offer, and it had nothing to do with memory.
 
-## The larger result: skipping cold start
+## The win I was not looking for
 
 Cold-starting the agent under gVisor takes about eleven seconds, almost all of it CPU:
 importing roughly 1,400 Python modules, most of the time spent inside the Gemini SDK
@@ -418,9 +419,10 @@ worth trying to break. Three checks.
 
 *Is it actually warm?* Yes. The restored agent serves its first real request in about 0.6
 seconds and its second in 29 milliseconds, steady at 20. There is no multi-second thrash.
-(One instrument read three seconds for the first request, which turned out to be an
-artifact: a wall-clock timer that had been running across the checkpoint freeze. The
-external clock and the 29 ms second request said otherwise.)
+(One instrument read three seconds for the first request, which was alarming right up until
+the cause turned out to be self-inflicted: a wall-clock timer left running across the
+checkpoint freeze, dutifully counting the time the process spent stopped. The external clock
+and the 29 ms second request set the record straight.)
 
 *Is it correct?* Bit-exact. Every post-restore response verified through the full agent
 path, and an in-memory accumulator the agent kept came back with precisely the value it
@@ -499,6 +501,7 @@ times cheaper, on any platform.
   per sandbox.
 
 The mechanism is sound where density matters, and it is proven on the platform that
-matters. The result worth leading with, though, is the one this work was not looking for:
-for a fleet of near-identical agents, the cheapest thing to do is not start them at all, and
-restore is how that is avoided. Sharing their memory is a bonus on top.
+matters. But the result worth leading with is the one this work tripped over while looking
+for something else: for a fleet of near-identical agents, the cheapest thing to do is not
+start them at all, and restore is how you avoid it. Sharing their memory, the thing this
+whole exercise set out to do, turns out to be the bonus on top.
