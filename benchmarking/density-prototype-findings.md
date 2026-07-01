@@ -633,6 +633,35 @@ NET: per-agent the latency win holds (warm, correct, sub-second uncontended, ~4x
 CPU); at burst it is CPU-throughput-limited and scales with cores -- provision cores for
 the burst rate, and restore makes each start ~4x cheaper rather than magically instant.
 
+### 13f. Snapshot storage + platform independence (2026-07-01)
+
+#1 STORAGE + CHECKPOINT TIME (KVM, ADK agent, warm rss 116M):
+  checkpoint --shared-base: wall 0.11s -- parking an agent is fast/cheap.
+  base.img = 81M actual (sparse; SHARED once across the whole pool).
+  PER-AGENT parked cost = checkpoint.img(state) 240K + pages.img(delta) 0 + pages_meta 8K
+    = ~248K.
+  vs NORMAL checkpoint = 81M pages + 240K state = ~81M PER AGENT.
+  So a warm pool of N: shared-base = 81M + N*248K; normal = N*81M. For N=10k: ~2.5G vs
+  ~810G (~300x less storage). The STORAGE flatten mirrors and EXCEEDS the memory flatten,
+  because a fresh clone's delta is ~0 (identical to base) and only the small kernel-state
+  file is per-agent. CAVEAT: delta grows as an agent diverges (accumulated heap/session),
+  but state+delta stays far below a full 81M checkpoint.
+
+#2 SYSTRAP LATENCY (no /dev/kvm; base-sharing is KVM-only per F9, so this uses a NORMAL
+   checkpoint -- it isolates the platform-independent LATENCY win):
+  systrap cold start (run->serving):     wall 4.05s  cpu 1.99s
+  systrap restore (restore->serving):    wall 0.18s  cpu 0.26s  (resp=BAD=0, correct)
+  vs KVM: cold 11.4s/7.1cpu, restore 0.6s.
+  -> The latency win HOLDS on systrap and is even larger here (~23x wall, ~8x cpu). systrap
+  beats KVM in THIS environment because gVisor-KVM pays nested-virt overhead on the GCE
+  nested host (on bare-metal KVM the gap narrows/reverses); the durable point is that the
+  restore-skips-cold-start win is PLATFORM-INDEPENDENT and needs no /dev/kvm, so it applies
+  to essentially all gVisor deployments -- unlike the density flatten, which is KVM-only.
+
+NET: parking is fast (0.11s) and cheap (~248K/agent shared-base vs 81M full = ~300x for a
+fresh pool); the latency win is UNIVERSAL (systrap included); the density flatten is KVM +
+large-active-base only. The two wins have different reach.
+
 ## 8. Status / next
 
 - [x] Lima VM, kernel/userfaultfd verified
