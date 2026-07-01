@@ -8,7 +8,7 @@ restored and ran correctly over the shared base.
 
 But the more useful result was not the one I set out to find. A real agent showed that small
 workloads quickly hit a fixed per-sandbox memory floor, which limits the density win. The
-bigger, platform-independent win was snapshot restore itself: skipping Python and framework
+bigger, portable win was snapshot restore itself: skipping Python and framework
 cold start made agents resume several times faster and cheaper on both KVM and systrap. The
 memory-sharing work was real; restore was the prize.
 
@@ -191,8 +191,8 @@ into a sandbox unless it is certain to be the page it claims to be. The rule I w
 The check is content-addressing, using Terrapin. Terrapin gives the whole base image a
 single dataset identity, `terrapin-sha256:<digest>`.
 
-The base is split into 2,097,152-byte
-(2 MiB) blocks, with the final block allowed to be smaller. Each leaf is hashed with GitOID SHA-256, the Git blob
+The base is split into 2 MiB blocks, exactly 2,097,152 bytes each, with the final block
+allowed to be smaller. Each leaf is hashed with GitOID SHA-256, the Git blob
 construction `sha256("blob " + len + "\0" + data)`. The leaf hashes are recursively reduced
 to a tree root, and that root is wrapped in a canonical manifest that commits the algorithm,
 block size, total length, and tree root. The Terrapin identifier is the GitOID of that
@@ -353,7 +353,7 @@ The answer was Google Cloud. A GCE instance with nested virtualization enabled e
 `/dev/kvm` backed by Linux KVM, which is the environment gVisor's KVM backend is built to
 use. It runs there without the host-resetting crashes that nesting KVM under Apple's or
 VMware's hypervisors produced. The same patched runsc, built on that instance, could finally run the test the
-earlier work could not.
+earlier setup could not.
 
 First, `runsc --platform=kvm` ran a sandbox at all, and the host stayed up. Then the test
 that mattered: the same small stateful workload, checkpointed and restored two ways, this
