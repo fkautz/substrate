@@ -108,8 +108,9 @@ This is the *checkpoint delta*: pages whose final contents differ from the base.
 total write traffic or churn (a page dirtied and then restored to its original bytes is not
 delta), which would matter for a different design but not for base/delta restore size. For a
 read-mostly service the per-clone delta is ~1.7%, so the flatten is worth building. The
-number is workload-dependent: a write-heavy agent has a larger delta, and density scales as
-`(RAM - base) / delta`.
+number is workload-dependent: a write-heavy agent has a larger delta, and the sharing
+ceiling falls as delta grows. For N clones, the ideal flatten is
+`N·(base+delta)/(base+N·delta)`; at large N it approaches `(base+delta)/delta`.
 
 ## Building it into gVisor: the base/delta split
 
@@ -188,8 +189,8 @@ into a sandbox unless it is certain to be the page it claims to be. The rule I w
 **verify-before-expose**: no byte reaches the guest without being checked first.
 
 The check is content-addressing, using Terrapin. Terrapin gives the whole base image a
-single dataset identity, `terrapin-sha256:<digest>`. The base is split into exact
-2,097,152-byte (2 MiB) leaves. Each leaf is hashed with GitOID SHA-256, the Git blob
+single dataset identity, `terrapin-sha256:<digest>`. The base is split into 2,097,152-byte
+(2 MiB) blocks, with the final block allowed to be smaller. Each leaf is hashed with GitOID SHA-256, the Git blob
 construction `sha256("blob " + len + "\0" + data)`; the leaf hashes are recursively reduced
 to a tree root; and that root is wrapped in a canonical manifest that commits the algorithm,
 block size, total length, and tree root. The Terrapin identifier is the GitOID of that
@@ -226,11 +227,13 @@ terminates at the authenticated ID and the sealed base, not at the bytes alone.
 
 Both paths were built and tested: an eager path (verify the whole base up front, then share)
 and a lazy/remote path (fetch, verify, and install each absent block on first access, with
-known-zero blocks installed via `UFFDIO_ZEROPAGE` and no fetch). Verification did not
+known-zero blocks (those the metadata marks as all zero) installed via `UFFDIO_ZEROPAGE`
+and no fetch). Verification did not
 materially change the measured resident-memory flatten in these tests, because it gates trust
 rather than adding resident pages. And it holds under attack: with one block deliberately
-corrupted in the store, the flipped byte changes the block's identity, so it is rejected at
-the fault and never exposed. Throughput numbers are in the measurement details at the end.
+corrupted in the store, the flipped byte changes the leaf hash, so recomputation no longer
+reaches the manifest root; the block is rejected at the fault and never exposed. Throughput
+numbers are in the measurement details at the end.
 
 At this point every layer was proven in-tree: share a base, copy-on-write a delta over it,
 compute the delta, exclude it on save, overlay it on restore, verify it eagerly or lazily,
@@ -344,10 +347,10 @@ That is where the story sat: the design lines up with KVM, but no `/dev/kvm` was
 reach to prove it on a running guest. Leaving a load-bearing claim resting on a code read is
 an uncomfortable place to stop, so the next move was to go find hardware.
 
-The answer was Google Cloud. A GCE instance with nested virtualization enabled exposes a real
-`/dev/kvm`, and because Google's nested virtualization is genuine Linux KVM, gVisor runs there
-without the host-resetting crashes that nesting KVM under Apple's or VMware's hypervisors
-produced. The same patched runsc, built on that instance, could finally run the test the
+The answer was Google Cloud. A GCE instance with nested virtualization enabled exposes
+`/dev/kvm` backed by Linux KVM, which is the environment gVisor's KVM backend is built to
+use. It runs there without the host-resetting crashes that nesting KVM under Apple's or
+VMware's hypervisors produced. The same patched runsc, built on that instance, could finally run the test the
 earlier work could not.
 
 First, `runsc --platform=kvm` ran a sandbox at all, and the host stayed up. Then the test
@@ -407,9 +410,8 @@ other overhead. The measured 2.9× is not a surprise; it is close to the floor-l
 ceiling. On a 15 GiB, four-core box about 300 of these sandboxes fit before memory ran out.
 
 For small agents, this changes the density story: base sharing is real, but the fixed sandbox
-floor dominates before the base-sharing mechanism does. A lukewarm verdict on density would
-have been a reasonable place to stop. The same agent had a better result to offer, and it had
-nothing to do with memory.
+floor dominates before the base-sharing mechanism does. The same agent had a better result to
+offer, and it had nothing to do with memory.
 
 ## The win I was not looking for
 
@@ -460,8 +462,9 @@ of what it did.
 
 The density flatten is KVM-only, because it depends on the base overlay reaching the guest,
 and that only happens on KVM. Skipping the cold start does not use the overlay at all; it
-needs only checkpoint and restore, which work on every gVisor platform. The same
-cold-versus-restore test on systrap, the platform used where there is no `/dev/kvm`:
+needs only ordinary checkpoint and restore. In these tests, that made the latency win work on
+both KVM and systrap. The same cold-versus-restore test on systrap, the platform used where
+there is no `/dev/kvm`:
 
 ```
  systrap    cold 4.05 s / 1.99 s CPU   →   restore 0.18 s / 0.26 s CPU   (correct)
@@ -515,14 +518,13 @@ cheaper, on any platform.
 - **Base-aware accounting.** Resident base pages should be counted once per node, not once per
   sandbox.
 
-The base-sharing mechanism works where its assumptions match the platform. KVM consumes the
-sentry's composed memory view, so a shared base plus copy-on-write delta can cut physical
-memory substantially when the resident base is large enough. systrap does not consume that
-view, so the same mechanism does not apply there.
+Base sharing works where the platform consumes the sentry's composed memory view: KVM does,
+systrap does not. That makes memory sharing a real density bonus on KVM when the active
+resident base is large enough.
 
-But the result I would build around first is platform-independent: do not cold-start
-near-identical agents. Snapshot them after initialization and restore them when needed. Memory
-sharing can be the density bonus on KVM; skipping startup is the win everywhere.
+The result I would build around first is broader: do not cold-start near-identical agents.
+Snapshot them after initialization and restore them when needed. Skipping startup is the win
+everywhere; shared guest memory is the KVM bonus.
 
 ## Measurement details
 
