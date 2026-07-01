@@ -189,7 +189,7 @@ sandbox itself: a node-local cache, a peer, an object store. A base page should 
 into a sandbox unless it is certain to be the page it claims to be. The rule to enforce is
 **verify-before-expose**: no byte reaches the guest without being checked first.
 
-The check is content-addressing, using Terrapin (v0.3). Terrapin gives the whole base image a
+The check is content-addressing, using [Terrapin (v0.3)](https://hackmd.io/rXTXMhjwTgGY3Yn4qEX96A). Terrapin gives the whole base image a
 single dataset identity, `terrapin-sha256:<digest>`. The scheme is cross-confirmed by two
 independent v0.3 implementations, [terrapin-go](https://github.com/fkautz/terrapin-go) and
 terrapin-rs.
