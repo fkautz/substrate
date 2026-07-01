@@ -1,0 +1,230 @@
+diff --git a/pkg/sentry/control/state.go b/pkg/sentry/control/state.go
+index f5b0b259e..777248133 100644
+--- a/pkg/sentry/control/state.go
++++ b/pkg/sentry/control/state.go
+@@ -17,6 +17,7 @@ package control
+ import (
+ 	"errors"
+ 	"fmt"
++	"os"
+ 	"strings"
+ 	"time"
+ 
+@@ -83,6 +84,10 @@ type SaveOpts struct {
+ 	// metadata file is provided.
+ 	HavePagesFile bool `json:"have_pages_file"`
+ 
++	// SharedBase indicates a base.img output is appended to FilePayload (GVISOR-3
++	// C1b): the sentry exports the shared base and saves a delta-only checkpoint.
++	SharedBase bool `json:"shared_base"`
++
+ 	// FilePayload contains the following:
+ 	// 1. checkpoint state file.
+ 	// 2. optional checkpoint pages metadata file.
+@@ -154,6 +159,9 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
+ 	if o.HavePagesFile {
+ 		wantFiles += 2
+ 	}
++	if o.SharedBase {
++		wantFiles++
++	}
+ 	if gotFiles := len(o.FilePayload.Files); gotFiles != wantFiles {
+ 		return fmt.Errorf("got %d files, wanted %d", gotFiles, wantFiles)
+ 	}
+@@ -183,6 +191,13 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
+ 		}
+ 		saveOpts.PagesFile = stateio.NewPagesFileFDWriterDefault(int32(pagesFileFD))
+ 	}
++	if o.SharedBase {
++		baseFD, err := unix.Dup(int(o.Files[3].Fd()))
++		if err != nil {
++			return err
++		}
++		saveOpts.SharedBaseFile = os.NewFile(uintptr(baseFD), "base.img")
++	}
+ 	return nil
+ }
+ 
+diff --git a/pkg/sentry/kernel/kernel.go b/pkg/sentry/kernel/kernel.go
+index f4cb000b9..78837e06b 100644
+--- a/pkg/sentry/kernel/kernel.go
++++ b/pkg/sentry/kernel/kernel.go
+@@ -693,7 +693,7 @@ func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[checkpoint.R
+ // pagesMetadata, and pagesFile, even if it returns a non-nil error.
+ //
+ // Preconditions: The kernel must be paused throughout the call to SaveTo.
+-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool) error {
++func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, baseFile *os.File, appMFExcludeCommittedZeroPages, resume bool) error {
+ 	if hostarch.PageSize != 4096 {
+ 		return fmt.Errorf("save is not supported with %dK page size", hostarch.PageSize/1024)
+ 	}
+@@ -742,7 +742,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
+ 			mfSaveWg.Add(1)
+ 			go func() {
+ 				defer mfSaveWg.Done()
+-				mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSave, appMFExcludeCommittedZeroPages) // transfers ownership
++				mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, baseFile, mfsToSave, appMFExcludeCommittedZeroPages) // transfers ownership
+ 			}()
+ 			pagesCleanup.Release()
+ 			// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
+@@ -796,7 +796,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
+ 				return mfSaveErr
+ 			}
+ 		} else {
+-			mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSave, appMFExcludeCommittedZeroPages)
++			mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, baseFile, mfsToSave, appMFExcludeCommittedZeroPages)
+ 			if mfSaveErr != nil {
+ 				return mfSaveErr
+ 			}
+@@ -825,7 +825,7 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
+ // pagesFile must be non-nil, saveMemoryFiles takes ownership of both
+ // pagesMetadata and pagesFile (even if it returns a non-nil error), and
+ // MemoryFile state will be saved to pagesMetadata and pagesFile.
+-func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
++func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, baseFile *os.File, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
+ 	memoryStart := time.Now()
+ 
+ 	pmw := w
+@@ -861,9 +861,22 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
+ 		mfOpts.PagesFile = apfs
+ 	}
+ 
++	// GVISOR-3 (C1b): export the main MemoryFile's shared base and save only the
++	// delta against it. Applies to the MAIN MemoryFile only; cleared before the
++	// private MemoryFiles (which have no base).
++	if baseFile != nil {
++		baseBytes, err := k.mf.ExportLinearBase(baseFile)
++		if err != nil {
++			return fmt.Errorf("exporting shared base: %w", err)
++		}
++		mfOpts.SharedBaseFile = baseFile
++		mfOpts.SharedBaseBytes = baseBytes
++	}
+ 	if err := k.mf.SaveTo(ctx, pmw, &mfOpts); err != nil {
+ 		return err
+ 	}
++	mfOpts.SharedBaseFile = nil
++	mfOpts.SharedBaseBytes = 0
+ 	// appMFExcludeCommittedZeroPages is expected to reflect application memory
+ 	// usage behavior, but not necessarily usage of private MemoryFiles.
+ 	mfOpts.ExcludeCommittedZeroPages = false
+diff --git a/pkg/sentry/state/state.go b/pkg/sentry/state/state.go
+index 199d1d330..f1393515a 100644
+--- a/pkg/sentry/state/state.go
++++ b/pkg/sentry/state/state.go
+@@ -18,6 +18,7 @@ package state
+ import (
+ 	"errors"
+ 	"fmt"
++	"os"
+ 	"io"
+ 	"time"
+ 
+@@ -54,6 +55,11 @@ type SaveOpts struct {
+ 	// PagesFile is non-nil. Otherwise this content is stored in Destination.
+ 	PagesFile stateio.AsyncWriter
+ 
++	// SharedBaseFile, if non-nil, is the base.img output: k.SaveTo exports the
++	// main MemoryFile's shared base into it and saves a delta-only checkpoint
++	// against it (GVISOR-3 C1b).
++	SharedBaseFile *os.File
++
+ 	// Key is used to enable state integrity check.
+ 	Key []byte
+ 
+@@ -157,9 +163,10 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
+ 	} else {
+ 		opts.Destination = nil
+ 		// Save the kernel.
+-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile
++		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.SharedBaseFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership
+ 		opts.PagesMetadata = nil
+ 		opts.PagesFile = nil
++		opts.SharedBaseFile = nil
+ 	}
+ 
+ 	t1, _ := CPUTime()
+diff --git a/runsc/cmd/checkpoint.go b/runsc/cmd/checkpoint.go
+index b6419d583..6b7c8e996 100644
+--- a/runsc/cmd/checkpoint.go
++++ b/runsc/cmd/checkpoint.go
+@@ -40,6 +40,7 @@ type Checkpoint struct {
+ 	excludeCommittedZeroPages bool
+ 	cudaCheckpointPath        string
+ 	cudaCheckpointSequential  bool
++	sharedBase                bool
+ 	saveRestoreExecArgv       string
+ 	saveRestoreExecTimeout    time.Duration
+ 
+@@ -75,6 +76,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
+ 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
+ 	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
+ 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
++	f.BoolVar(&c.sharedBase, "shared-base", false, "produce base.img and a delta-only checkpoint against it (GVISOR-3)")
+ 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
+ 	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
+ 
+@@ -121,6 +123,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
+ 		ExcludeCommittedZeroPages:  c.excludeCommittedZeroPages,
+ 		CudaCheckpointPath:         c.cudaCheckpointPath,
+ 		CudaCheckpointSequential:   c.cudaCheckpointSequential,
++		SharedBase:                 c.sharedBase,
+ 		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
+ 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
+ 		SaveRestoreExecContainerID: cont.ID,
+diff --git a/runsc/sandbox/sandbox.go b/runsc/sandbox/sandbox.go
+index d01e58819..6a07047b2 100644
+--- a/runsc/sandbox/sandbox.go
++++ b/runsc/sandbox/sandbox.go
+@@ -635,6 +635,25 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
+ 	} else {
+ 		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
+ 	}
++
++	// GVISOR-3 (C1): an optional shared base memory image (base.img) in imagePath.
++	// When present, the main MemoryFile is restored over it (MAP_PRIVATE overlay +
++	// delta), so clones from a delta-only checkpoint physically share the base.
++	baseFileName := path.Join(imagePath, "base.img")
++	if bf, err := os.Open(baseFileName); err == nil {
++		fi, ferr := bf.Stat()
++		if ferr != nil {
++			bf.Close()
++			return fmt.Errorf("stat base image %q: %w", baseFileName, ferr)
++		}
++		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
++		opt.HaveBaseFile = true
++		opt.BaseFileIndex = len(opt.FilePayload.Files) - 1
++		opt.BaseFileBytes = uint64(fi.Size())
++		log.Infof("Restoring main MemoryFile over shared base image %q (%d bytes)", baseFileName, fi.Size())
++	} else if !os.IsNotExist(err) {
++		return fmt.Errorf("opening base image %q failed: %w", baseFileName, err)
++	}
+ 	return nil
+ }
+ 
+@@ -1612,6 +1631,7 @@ type CheckpointOpts struct {
+ 	ExcludeCommittedZeroPages bool
+ 	CudaCheckpointPath        string
+ 	CudaCheckpointSequential  bool
++	SharedBase                bool
+ 
+ 	// Save/restore exec options.
+ 	SaveRestoreExecArgv        string
+@@ -1674,6 +1694,17 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
+ 	}
+ 	opt.FilePayload.Files = files
+ 	opt.HavePagesFile = len(files) > 1
++	// GVISOR-3 (C1b): add a base.img output so the sentry exports the shared base
++	// and saves a delta-only checkpoint against it.
++	if opts.SharedBase && opt.HavePagesFile {
++		basePath := filepath.Join(imagePath, "base.img")
++		bf, err := os.OpenFile(basePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
++		if err != nil {
++			return fmt.Errorf("creating base image %q: %w", basePath, err)
++		}
++		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
++		opt.SharedBase = true
++	}
+ 	return nil
+ }
+ 
