@@ -2834,7 +2834,12 @@ tree root). The three differ in language and codebase, and the clean-room one wa
 from the prose alone, so their agreement evidences that the encoding is language-independent
 and the grammar is followable from the text; but ALL THREE share one author, so this is
 implementation and description diversity, NOT author-independent confirmation (a second
-implementer could still surface a shared blind spot in the prose). Agreement here is the
+implementer could still surface a shared blind spot in the prose). A further limit on that evidence: the clean-room
+oracle had the expected values IN VIEW for every vector except the 130 GiB + 1 case (which
+it computed with no target), so for the pre-existing vectors its agreement is REPRODUCTIVE,
+not predictive; rs/go reproduction of the 130 GiB + 1 vector is therefore the set's only
+blind cross-prediction, and a disagreement there would be signal about the prose, not just a
+bug. Agreement here is the
 encoder/identifier direction only; the §15.3 manifest accept/reject matrix is a separate
 conformance surface the clean-room oracle did not exercise. The partial-tail vector SPARSE-8
 requires (case (a), the 130 GiB + 1 pure-zero object) is now provided below, but from the
@@ -2878,7 +2883,10 @@ the 1025-entry partial block.
     130 GiB + 1 zero (66561 blk) = 266a590c4206a2edfc2b2200b872b515cb35a2bd9dabb7556f6450c7419c84c3
       (tree root = 9e7c35ee337543af728d04b5d16fba6d12f8f2c6b814925d214c1eefdf09cb16)
   This is a clean-room-oracle value; the two production oracles MUST reproduce it before
-  ENC-CONF-2 is fully satisfied (§16 freeze).
+  ENC-CONF-2 is fully satisfied (§16 freeze). It is also the ONLY value in §15.3 the
+  clean-room oracle computed with no target in view, so this reproduction is the vector
+  set's only blind cross-prediction between any two of the three implementations: a
+  disagreement here is signal about the prose, not merely a bug.
 
 Manifest accept/reject (canonical Terrapin manifest, §2.2): a manifest MUST be
 ASCII, LF-terminated (including the last line), field order exactly terrapin,
