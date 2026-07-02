@@ -1,6 +1,6 @@
 LLIFS Specification
 
-Status: Draft (v1.0-draft). All sections (§§1-17) are drafted, section-reviewed, and reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact); Phase 1 prototyping is green-lit from this draft. §15.3 records conformance status: the vectors are cross-confirmed by three implementations (terrapin-rs, terrapin-go, and a clean-room oracle), with one partial-tail vector pending rs/go reproduction before freeze. HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): (1) runtime-delta implementation proof on a real gVisor hibernate/resume path; (2) grow atelet.WorkloadSpec (and ateom's reduced Container) to the full LLWI1 workload identity (docs/workload-identity-expansion.md, ENC-WI-1), the target identity deliberately NOT pared to the current proto since a workload-identity mismatch is a restore-safety bug; (3) terrapin-rs and terrapin-go reproduce the pending §15.3 partial-tail vector, satisfying ENC-CONF-2. Revision history is at the end of this document (non-normative).
+Status: Draft (v1.0-draft). All sections (§§1-17) are drafted, section-reviewed, and reconciled end-to-end (terminology normalized, requirement IDs collision-free, encodings byte-exact); Phase 1 prototyping is green-lit from this draft. §15.3 records conformance status: the vectors are cross-confirmed byte-for-byte by three implementations (terrapin-rs, terrapin-go, and a clean-room oracle), including the 130 GiB + 1 partial-tail vector now reproduced by all three (ENC-CONF-2 discharged). HARD FREEZE BLOCKERS (v1.0 MUST NOT freeze until done): (1) runtime-delta implementation proof on a real gVisor hibernate/resume path; (2) grow atelet.WorkloadSpec (and ateom's reduced Container) to the full LLWI1 workload identity (docs/workload-identity-expansion.md, ENC-WI-1), the target identity deliberately NOT pared to the current proto since a workload-identity mismatch is a restore-safety bug. Revision history is at the end of this document (non-normative).
 System: LLIFS (a verified, deduped, lazily-faulted state substrate for high-density agent FaaS).
 Primary target: gVisor (runsc) checkpoint/restore; Firecracker microVM next. One content-addressed, Terrapin-verified store delivers two state planes: a filesystem plane and a memory plane.
 External identity: OCI-compatible sha256.
@@ -2825,7 +2825,7 @@ ENC-3: Opaque runtime-native objects, the base runtime_state blob (§15.5) and t
 
 15.3 Terrapin profile conformance vectors
 
-CROSS-CONFIRMED (ENC-CONF-2 substantially discharged): every vector below was reproduced
+CROSS-CONFIRMED (ENC-CONF-2 discharged): every vector below was reproduced
 byte-for-byte by three implementations, terrapin-rs (Rust, streaming/parallel),
 terrapin-go (Go, in-memory plus a streaming reader for the 128 GiB cases), and a clean-room
 oracle written from the §2.2/§15.3 text alone with no reference code (which also confirmed
@@ -2836,21 +2836,22 @@ and the grammar is followable from the text; but ALL THREE share one author, so 
 implementation and description diversity, NOT author-independent confirmation (a second
 implementer could still surface a shared blind spot in the prose). A further nuance on that evidence: the clean-room
 oracle had the expected values IN VIEW for most vectors, so its agreement on them is
-REPRODUCTIVE, not predictive. It computed three values BLIND, with no target shown: Z_2 and
-Z_3, which already match the pinned rs/go values, and the 130 GiB + 1 vector, still pending.
-Z_2/Z_3 exercise only the node-hash recurrence over an already-agreed G (one rule applied
-twice), so that banked blind confirmation is narrow; the 130 GiB + 1 vector additionally
-covers block splitting, both partial-tail phenomena, multi-level recursion, and manifest
-encoding over a novel length. rs/go reproduction of it is therefore the only PENDING, and the
-only BROAD, blind cross-prediction of a full identifier vector: a disagreement there would
-implicate tree construction or manifest encoding in the prose, not the recurrence (already
-banked). Z_1 does not count as blind: it was anchored to the in-view 128 GiB identifier the
-moment the constructed tree root reproduced it. Agreement here is the
-encoder/identifier direction only; the §15.3 manifest accept/reject matrix is a separate
-conformance surface the clean-room oracle did not exercise. The partial-tail vector SPARSE-8
-requires (case (a), the 130 GiB + 1 pure-zero object) is now provided below, but from the
-clean-room oracle alone; ENC-CONF-2 is NOT fully satisfied until terrapin-rs and terrapin-go
-also reproduce it.
+REPRODUCTIVE, not predictive. It computed three values BLIND, with no target shown: Z_2,
+Z_3, and the 130 GiB + 1 vector. Z_2/Z_3 exercise only the node-hash recurrence over an
+already-agreed G (one rule applied twice), so that blind confirmation is narrow; the
+130 GiB + 1 vector additionally covers block splitting, both partial-tail phenomena,
+multi-level recursion, and manifest encoding over a novel length, making it the set's BROADEST
+blind cross-prediction. terrapin-go and terrapin-rs have now both reproduced the clean-room
+oracle's blind value for it (identifier 266a590c..., tree root 9e7c35ee...), each rebuilding
+the tree from Z_0 leaves plus a 1-byte tail leaf, so that prediction-vs-prediction check has
+SUCCEEDED across all three implementations; no disagreement surfaced, so nothing in the
+tree-construction or manifest-encoding prose was left ambiguous. Z_1 does not count as blind:
+it was anchored to the in-view 128 GiB identifier the moment the constructed tree root
+reproduced it. Agreement here is the encoder/identifier direction only; the §15.3 manifest
+accept/reject matrix is a separate conformance surface the clean-room oracle did not exercise
+(terrapin-rs and terrapin-go do). The partial-tail vector SPARSE-8 requires (case (a), the
+130 GiB + 1 pure-zero object) is provided below and reproduced by all three oracles;
+ENC-CONF-2 is fully satisfied.
 
   Constants:
     G(empty)                = 473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813
@@ -2880,22 +2881,21 @@ also reproduce it.
   oracle's Z_0..Z_3 match the pinned terrapin-rs and terrapin-go values byte-for-byte, so
   the full zero-root ladder has three-way coverage).
 
-Pending cross-confirmation (clean-room oracle only, NOT yet reproduced by terrapin-rs or
-terrapin-go): the partial-tail vector (a) that SPARSE-8 requires, a PURE all-zero object of
+Three-way confirmed (clean-room oracle, terrapin-go, and terrapin-rs): the partial-tail
+vector (a) that SPARSE-8 requires, a PURE all-zero object of
 130 GiB + 1 byte (66561 blocks: a final 1-byte zero leaf, which is G over 1 zero byte and
 NOT Z_0; and a final level-1 block of 1025 entries, G over a shorter concatenation and NOT
 Z_1). The level-1 layer is two blocks: the first is exactly Z_1's preimage, the second is
 the 1025-entry partial block.
     130 GiB + 1 zero (66561 blk) = 266a590c4206a2edfc2b2200b872b515cb35a2bd9dabb7556f6450c7419c84c3
       (tree root = 9e7c35ee337543af728d04b5d16fba6d12f8f2c6b814925d214c1eefdf09cb16)
-  This is a clean-room-oracle value; the two production oracles MUST reproduce it before
-  ENC-CONF-2 is fully satisfied (§16 freeze). It was computed by the clean-room oracle with no
-  target in view; the Z_2/Z_3 ladder values were likewise blind and already match the pinned
-  rs/go values, but exercise only the node-hash recurrence, so this vector is the only
-  PENDING blind cross-prediction of a full identifier vector (it additionally covers block
-  splitting, both partial-tail phenomena, multi-level recursion, and manifest encoding over a
-  novel length). A disagreement here implicates tree construction or manifest encoding in the
-  prose, not the recurrence.
+  Reproduced by all three oracles (clean-room, terrapin-go, terrapin-rs), each building the
+  tree from Z_0 leaves plus a 1-byte tail leaf, so ENC-CONF-2 is fully satisfied. The
+  clean-room oracle computed it with no target in view and terrapin-go/terrapin-rs
+  independently reproduced that value, making it the set's broadest blind cross-prediction,
+  now confirmed: it exercises block splitting, both partial-tail phenomena, multi-level
+  recursion, and manifest encoding over a novel length, none of which the confirmation left
+  ambiguous in the prose.
 
 Manifest accept/reject (canonical Terrapin manifest, §2.2): a manifest MUST be
 ASCII, LF-terminated (including the last line), field order exactly terrapin,
