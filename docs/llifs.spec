@@ -2834,12 +2834,18 @@ tree root). The three differ in language and codebase, and the clean-room one wa
 from the prose alone, so their agreement evidences that the encoding is language-independent
 and the grammar is followable from the text; but ALL THREE share one author, so this is
 implementation and description diversity, NOT author-independent confirmation (a second
-implementer could still surface a shared blind spot in the prose). A further limit on that evidence: the clean-room
-oracle had the expected values IN VIEW for every vector except the 130 GiB + 1 case (which
-it computed with no target), so for the pre-existing vectors its agreement is REPRODUCTIVE,
-not predictive; rs/go reproduction of the 130 GiB + 1 vector is therefore the set's only
-blind cross-prediction, and a disagreement there would be signal about the prose, not just a
-bug. Agreement here is the
+implementer could still surface a shared blind spot in the prose). A further nuance on that evidence: the clean-room
+oracle had the expected values IN VIEW for most vectors, so its agreement on them is
+REPRODUCTIVE, not predictive. It computed three values BLIND, with no target shown: Z_2 and
+Z_3, which already match the pinned rs/go values, and the 130 GiB + 1 vector, still pending.
+Z_2/Z_3 exercise only the node-hash recurrence over an already-agreed G (one rule applied
+twice), so that banked blind confirmation is narrow; the 130 GiB + 1 vector additionally
+covers block splitting, both partial-tail phenomena, multi-level recursion, and manifest
+encoding over a novel length. rs/go reproduction of it is therefore the only PENDING, and the
+only BROAD, blind cross-prediction of a full identifier vector: a disagreement there would
+implicate tree construction or manifest encoding in the prose, not the recurrence (already
+banked). Z_1 does not count as blind: it was anchored to the in-view 128 GiB identifier the
+moment the constructed tree root reproduced it. Agreement here is the
 encoder/identifier direction only; the §15.3 manifest accept/reject matrix is a separate
 conformance surface the clean-room oracle did not exercise. The partial-tail vector SPARSE-8
 requires (case (a), the 130 GiB + 1 pure-zero object) is now provided below, but from the
@@ -2883,10 +2889,13 @@ the 1025-entry partial block.
     130 GiB + 1 zero (66561 blk) = 266a590c4206a2edfc2b2200b872b515cb35a2bd9dabb7556f6450c7419c84c3
       (tree root = 9e7c35ee337543af728d04b5d16fba6d12f8f2c6b814925d214c1eefdf09cb16)
   This is a clean-room-oracle value; the two production oracles MUST reproduce it before
-  ENC-CONF-2 is fully satisfied (§16 freeze). It is also the ONLY value in §15.3 the
-  clean-room oracle computed with no target in view, so this reproduction is the vector
-  set's only blind cross-prediction between any two of the three implementations: a
-  disagreement here is signal about the prose, not merely a bug.
+  ENC-CONF-2 is fully satisfied (§16 freeze). It was computed by the clean-room oracle with no
+  target in view; the Z_2/Z_3 ladder values were likewise blind and already match the pinned
+  rs/go values, but exercise only the node-hash recurrence, so this vector is the only
+  PENDING blind cross-prediction of a full identifier vector (it additionally covers block
+  splitting, both partial-tail phenomena, multi-level recursion, and manifest encoding over a
+  novel length). A disagreement here implicates tree construction or manifest encoding in the
+  prose, not the recurrence.
 
 Manifest accept/reject (canonical Terrapin manifest, §2.2): a manifest MUST be
 ASCII, LF-terminated (including the last line), field order exactly terrapin,
