@@ -2834,7 +2834,7 @@ Z_1 = G(Z_0 repeated 65536 times) equals the 128 GiB zero tree root). Three inde
 canonical manifest encoders agreeing rules out silent manifest divergence and is evidence
 the manifest grammar is unambiguous (this is the encoder/identifier direction; the §15.3
 manifest accept/reject matrix is a separate conformance surface the clean-room oracle did
-not exercise). the partial-tail vector SPARSE-8
+not exercise). The partial-tail vector SPARSE-8
 requires (case (a), the 130 GiB + 1 pure-zero object) is now provided below, but from the
 clean-room oracle alone; ENC-CONF-2 is NOT fully satisfied until terrapin-rs and terrapin-go
 also reproduce it.
@@ -2863,7 +2863,9 @@ also reproduce it.
   Z_0 and Z_1 are vector-validated: Z_0 equals the G(2 MiB zero block) constant, and
   Z_1 is the tree root of the 128 GiB zero vector (G(manifest(137438953472, Z_1))
   equals the 128 GiB identifier above). Z_2 and Z_3 follow from the same node-hash
-  recurrence over the agreed G; both oracles compute them identically.
+  recurrence over the agreed G; all three oracles compute them identically (the clean-room
+  oracle's Z_0..Z_3 match the pinned terrapin-rs and terrapin-go values byte-for-byte, so
+  the full zero-root ladder has three-way coverage).
 
 Pending cross-confirmation (clean-room oracle only, NOT yet reproduced by terrapin-rs or
 terrapin-go): the partial-tail vector (a) that SPARSE-8 requires, a PURE all-zero object of
