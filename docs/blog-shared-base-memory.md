@@ -52,7 +52,7 @@ The rest of the post walks the evidence in order:
 | Linux `MAP_PRIVATE` smoke test | Will the kernel physically share clean mapped file pages? | Yes. PSS scales roughly as base/N; writes copy-on-write only in the writer. |
 | Live gVisor memory diff | Is the per-clone delta small? | 5000 requests to a warmed Go server changed 8.6 MiB, about 1.7% of base. |
 | gVisor `MemoryFile` tests | Does base/delta save/restore preserve memory? | Yes, through both the sync and async load paths. |
-| runsc on systrap | Does a real restored guest run over the overlay? | No. systrap maps guest memory from the memfd in a separate stub. |
+| runsc on systrap | Does the shared-base *overlay* reach the running guest? | No — systrap maps the guest from the memfd in a separate stub, so the overlay is invisible to it. Ordinary checkpoint/restore, and the latency win, still work on systrap. |
 | runsc on KVM | Does the same design run end-to-end? | Yes. The guest resumed correctly over the shared base. |
 | Real ADK agent | Is density the main product win? | Not for small agents. Restore latency was the larger, cross-platform win. |
 
@@ -373,7 +373,7 @@ restore WITHOUT base.img (--platform=kvm):  ticks continue, checksum=ok   (regre
 restore WITH    base.img (--platform=kvm):  ticks continue, checksum=ok   ✅
 ```
 
-The workload that crashed on systrap resumed cleanly on KVM, memory intact, with the debug
+The workload that crashed on systrap's shared-base restore resumed cleanly on KVM, memory intact, with the debug
 log confirming the base image was threaded in and the overlay applied. The platform boundary
 was not a hedge. KVM maps the guest from `MapInternal`, exactly the mapping the overlay
 modifies, so the guest sees the shared base and the copy-on-write delta, while the same
