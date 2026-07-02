@@ -365,7 +365,7 @@ Findings:
   backing, verifying each block as it is fetched from the CAS, once per node) is the
   section-8 transport case and reuses this same verify step.
 
-NOTE: verify_share/go.mod uses a local `replace` to /Users/fkautz/src/terrapin-go
+NOTE: verify_share/go.mod requires github.com/fkautz/terrapin-go v0.3.0 (published)
 (branch terrapin-v0.3); build it where terrapin-go is checked out (the llifs VM / host).
 
 ## 12. B3 lazy/remote: userfaultfd CAS-fetch + Terrapin-verify, once per node
@@ -412,7 +412,7 @@ Findings:
   eager full-base verify). The CAS here is in-process (freed before the rollup, since
   it stands in for a remote store); a real deployment fetches from the §8 CAS/packs.
 
-NOTE: lazy_verify/go.mod uses a local `replace` to /Users/fkautz/src/terrapin-go
+NOTE: lazy_verify/go.mod requires github.com/fkautz/terrapin-go v0.3.0 (published)
 (branch terrapin-v0.3); uffd ioctl numbers and syscall nrs are for linux/arm64.
 
 ## 13. C1: runsc restore-side base plumbing + the layering finding (F9)
