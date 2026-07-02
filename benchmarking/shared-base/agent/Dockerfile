@@ -1,0 +1,3 @@
+FROM python:3.12-slim
+RUN pip install --no-cache-dir google-adk
+COPY agent.py /agent.py

@@ -1,0 +1,1951 @@
+diff --git a/pkg/sentry/control/state.go b/pkg/sentry/control/state.go
+index f5b0b259e..777248133 100644
+--- a/pkg/sentry/control/state.go
++++ b/pkg/sentry/control/state.go
+@@ -17,6 +17,7 @@ package control
+ import (
+ 	"errors"
+ 	"fmt"
++	"os"
+ 	"strings"
+ 	"time"
+ 
+@@ -83,6 +84,10 @@ type SaveOpts struct {
+ 	// metadata file is provided.
+ 	HavePagesFile bool `json:"have_pages_file"`
+ 
++	// SharedBase indicates a base.img output is appended to FilePayload (GVISOR-3
++	// C1b): the sentry exports the shared base and saves a delta-only checkpoint.
++	SharedBase bool `json:"shared_base"`
++
+ 	// FilePayload contains the following:
+ 	// 1. checkpoint state file.
+ 	// 2. optional checkpoint pages metadata file.
+@@ -154,6 +159,9 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
+ 	if o.HavePagesFile {
+ 		wantFiles += 2
+ 	}
++	if o.SharedBase {
++		wantFiles++
++	}
+ 	if gotFiles := len(o.FilePayload.Files); gotFiles != wantFiles {
+ 		return fmt.Errorf("got %d files, wanted %d", gotFiles, wantFiles)
+ 	}
+@@ -183,6 +191,13 @@ func setSaveOptsForLocalCheckpointFiles(o *SaveOpts, saveOpts *state.SaveOpts) e
+ 		}
+ 		saveOpts.PagesFile = stateio.NewPagesFileFDWriterDefault(int32(pagesFileFD))
+ 	}
++	if o.SharedBase {
++		baseFD, err := unix.Dup(int(o.Files[3].Fd()))
++		if err != nil {
++			return err
++		}
++		saveOpts.SharedBaseFile = os.NewFile(uintptr(baseFD), "base.img")
++	}
+ 	return nil
+ }
+ 
+diff --git a/pkg/sentry/kernel/kernel.go b/pkg/sentry/kernel/kernel.go
+index f4cb000b9..78837e06b 100644
+--- a/pkg/sentry/kernel/kernel.go
++++ b/pkg/sentry/kernel/kernel.go
+@@ -693,7 +693,7 @@ func savePrivateMFs(ctx context.Context, w io.Writer, mfsToSave map[checkpoint.R
+ // pagesMetadata, and pagesFile, even if it returns a non-nil error.
+ //
+ // Preconditions: The kernel must be paused throughout the call to SaveTo.
+-func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, appMFExcludeCommittedZeroPages, resume bool) error {
++func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, baseFile *os.File, appMFExcludeCommittedZeroPages, resume bool) error {
+ 	if hostarch.PageSize != 4096 {
+ 		return fmt.Errorf("save is not supported with %dK page size", hostarch.PageSize/1024)
+ 	}
+@@ -742,7 +742,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
+ 			mfSaveWg.Add(1)
+ 			go func() {
+ 				defer mfSaveWg.Done()
+-				mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, mfsToSave, appMFExcludeCommittedZeroPages) // transfers ownership
++				mfSaveErr = k.saveMemoryFiles(ctx, nil, pagesMetadata, pagesFile, baseFile, mfsToSave, appMFExcludeCommittedZeroPages) // transfers ownership
+ 			}()
+ 			pagesCleanup.Release()
+ 			// Defer a Wait() so we wait for k.saveMemoryFiles() to complete even if we
+@@ -796,7 +796,7 @@ func (k *Kernel) SaveTo(ctx context.Context, stateFile, pagesMetadata io.WriteCl
+ 				return mfSaveErr
+ 			}
+ 		} else {
+-			mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, mfsToSave, appMFExcludeCommittedZeroPages)
++			mfSaveErr = k.saveMemoryFiles(ctx, stateFile, nil, nil, baseFile, mfsToSave, appMFExcludeCommittedZeroPages)
+ 			if mfSaveErr != nil {
+ 				return mfSaveErr
+ 			}
+@@ -825,7 +825,7 @@ func (k *Kernel) BeforeResume(ctx context.Context) {
+ // pagesFile must be non-nil, saveMemoryFiles takes ownership of both
+ // pagesMetadata and pagesFile (even if it returns a non-nil error), and
+ // MemoryFile state will be saved to pagesMetadata and pagesFile.
+-func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
++func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata io.WriteCloser, pagesFile stateio.AsyncWriter, baseFile *os.File, mfsToSave map[checkpoint.ResourceID]*pgalloc.MemoryFile, appMFExcludeCommittedZeroPages bool) error {
+ 	memoryStart := time.Now()
+ 
+ 	pmw := w
+@@ -861,9 +861,22 @@ func (k *Kernel) saveMemoryFiles(ctx context.Context, w io.Writer, pagesMetadata
+ 		mfOpts.PagesFile = apfs
+ 	}
+ 
++	// GVISOR-3 (C1b): export the main MemoryFile's shared base and save only the
++	// delta against it. Applies to the MAIN MemoryFile only; cleared before the
++	// private MemoryFiles (which have no base).
++	if baseFile != nil {
++		baseBytes, err := k.mf.ExportLinearBase(baseFile)
++		if err != nil {
++			return fmt.Errorf("exporting shared base: %w", err)
++		}
++		mfOpts.SharedBaseFile = baseFile
++		mfOpts.SharedBaseBytes = baseBytes
++	}
+ 	if err := k.mf.SaveTo(ctx, pmw, &mfOpts); err != nil {
+ 		return err
+ 	}
++	mfOpts.SharedBaseFile = nil
++	mfOpts.SharedBaseBytes = 0
+ 	// appMFExcludeCommittedZeroPages is expected to reflect application memory
+ 	// usage behavior, but not necessarily usage of private MemoryFiles.
+ 	mfOpts.ExcludeCommittedZeroPages = false
+diff --git a/pkg/sentry/kernel/kernel_restore.go b/pkg/sentry/kernel/kernel_restore.go
+index 0f548ddcf..1131ce246 100644
+--- a/pkg/sentry/kernel/kernel_restore.go
++++ b/pkg/sentry/kernel/kernel_restore.go
+@@ -18,6 +18,7 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"math"
++	"os"
+ 
+ 	"gvisor.dev/gvisor/pkg/cleanup"
+ 	"gvisor.dev/gvisor/pkg/context"
+@@ -270,6 +271,11 @@ type AsyncMFLoader struct {
+ 
+ 	loadWg  sync.WaitGroup
+ 	loadErr error
++
++	// baseFile, if non-nil, is the shared base memory image overlaid on the main
++	// MemoryFile during restore (GVISOR-3 C1); baseBytes is its size.
++	baseFile  *os.File
++	baseBytes uint64
+ }
+ 
+ // NewAsyncMFLoader creates a new AsyncMFLoader. It takes ownership of
+@@ -279,9 +285,11 @@ type AsyncMFLoader struct {
+ // If timeline is provided, it will be used to track async page loading.
+ // It takes ownership of the timeline, and will end it when done loading all
+ // pages.
+-func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, timeline *timing.Timeline) *AsyncMFLoader {
++func NewAsyncMFLoader(pagesMetadata io.ReadCloser, pagesFile stateio.AsyncReader, mainMF *pgalloc.MemoryFile, baseFile *os.File, baseBytes uint64, timeline *timing.Timeline) *AsyncMFLoader {
+ 	mfl := &AsyncMFLoader{
+ 		privateMFsChan: make(chan map[checkpoint.ResourceID]*pgalloc.MemoryFile, 1),
++		baseFile:       baseFile,
++		baseBytes:      baseBytes,
+ 	}
+ 	mfl.mainMFStartWg.Add(1)
+ 	mfl.metadataWg.Add(1)
+@@ -314,6 +322,9 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
+ 	opts := pgalloc.LoadOpts{
+ 		PagesFile: apfl,
+ 		Timeline:  timeline,
++		// GVISOR-3 (C1): the shared base image overlays the MAIN MemoryFile only.
++		SharedBaseFile:  mfl.baseFile,
++		SharedBaseBytes: mfl.baseBytes,
+ 	}
+ 	// Note that we depend on opts.PagesFileOffset being carried between
+ 	// LoadFrom calls, so the same opts must be used for all calls.
+@@ -329,6 +340,10 @@ func (mfl *AsyncMFLoader) backgroundGoroutine(pagesMetadata io.ReadCloser, pages
+ 		log.Warningf("Failed to load main MemoryFile %p: %v", mainMF, err)
+ 		return
+ 	}
++	// The base image applies only to the main MemoryFile; private MemoryFiles
++	// (saved without a base) must load normally.
++	opts.SharedBaseFile = nil
++	opts.SharedBaseBytes = 0
+ 	timeline.Reached("waiting for privateMF info")
+ 	privateMFs := <-mfl.privateMFsChan
+ 	timeline.Reached("received privateMFs info")
+diff --git a/pkg/sentry/pgalloc/BUILD b/pkg/sentry/pgalloc/BUILD
+index 32f5a769c..7aaccccb9 100644
+--- a/pkg/sentry/pgalloc/BUILD
++++ b/pkg/sentry/pgalloc/BUILD
+@@ -207,10 +207,16 @@ go_test(
+     srcs = [
+         "pgalloc_64k_test.go",
+         "pgalloc_test.go",
++        "sharedbase_test.go",
++        "saverestore_test.go",
++        "flatten_test.go",
+     ],
+     library = ":pgalloc",
+     deps = [
++        "//pkg/context",
+         "//pkg/hostarch",
+         "//pkg/sentry/memmap",
++        "//pkg/sentry/state/stateio",
++        "//pkg/state",
+     ],
+ )
+diff --git a/pkg/sentry/pgalloc/flatten_test.go b/pkg/sentry/pgalloc/flatten_test.go
+new file mode 100644
+index 000000000..89c7ceb0c
+--- /dev/null
++++ b/pkg/sentry/pgalloc/flatten_test.go
+@@ -0,0 +1,144 @@
++// Copyright 2024 The gVisor Authors.
++// LLIFS GVISOR-3 S4: N-clone flatten measurement through the real SaveTo/LoadFrom
++// base/delta path. N MemoryFiles restore one delta-only checkpoint over ONE shared
++// base; /proc/self/smaps_rollup then shows the flatten directly: Rss counts the base
++// once per mapping (the would-be no-sharing footprint) while Pss counts it once
++// physically (the actual shared footprint), so Rss/Pss is the flatten ratio.
++package pgalloc
++
++import (
++	"bufio"
++	"bytes"
++	"os"
++	"strconv"
++	"strings"
++	"testing"
++
++	"gvisor.dev/gvisor/pkg/context"
++	"gvisor.dev/gvisor/pkg/hostarch"
++)
++
++func rollupKB(t *testing.T, key string) uint64 {
++	t.Helper()
++	f, err := os.Open("/proc/self/smaps_rollup")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer f.Close()
++	sc := bufio.NewScanner(f)
++	for sc.Scan() {
++		ln := sc.Text()
++		if strings.HasPrefix(ln, key+":") {
++			fields := strings.Fields(ln)
++			v, _ := strconv.ParseUint(fields[1], 10, 64)
++			return v // kB
++		}
++	}
++	return 0
++}
++
++func TestNCloneFlatten(t *testing.T) {
++	ctx := context.Background()
++	pg := uint64(hostarch.PageSize)
++	atoi := func(env string, def int) int {
++		if v := os.Getenv(env); v != "" {
++			if n, err := strconv.Atoi(v); err == nil {
++				return n
++			}
++		}
++		return def
++	}
++	baseMB := atoi("FLATTEN_BASE_MB", 64)
++	deltaMB := atoi("FLATTEN_DELTA_MB", 4)
++	nClones := atoi("FLATTEN_N", 16)
++	basePages := uint64(baseMB) * 256
++	deltaPages := uint64(deltaMB) * 256
++
++	// Build a warmed source MemoryFile and export it as the shared base.
++	src := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
++	fr, err := src.Allocate(basePages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ssl, err := src.MapInternal(fr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	smem := ssl.Head().ToSlice()
++	for p := uint64(0); p < basePages; p++ {
++		smem[p*pg] = byte(p%251 + 1) // non-zero so pages are real (not zero-excluded)
++	}
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	bsz, err := src.ExportLinearBase(base)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Apply a small delta, then save a delta-only checkpoint (sync path).
++	for p := uint64(0); p < deltaPages; p++ {
++		smem[p*pg] = 0xAA
++	}
++	var meta bytes.Buffer
++	if err := src.SaveTo(ctx, &meta, &SaveOpts{ExcludeCommittedZeroPages: true, SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
++		t.Fatalf("SaveTo: %v", err)
++	}
++	src.Destroy() // free the source so it does not confound the rollup
++
++	pssBefore := rollupKB(t, "Pss")
++
++	// Restore N clones over the ONE shared base; touch every base page so the base
++	// is resident (shared) and the delta is COW-private.
++	clones := make([]*MemoryFile, 0, nClones)
++	var sink byte
++	for c := 0; c < nClones; c++ {
++		dst := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
++		if err := dst.LoadFrom(ctx, bytes.NewReader(meta.Bytes()), &LoadOpts{SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
++			t.Fatalf("clone %d LoadFrom: %v", c, err)
++		}
++		dsl, err := dst.MapInternal(fr, hostarch.Read)
++		if err != nil {
++			t.Fatalf("clone %d MapInternal: %v", c, err)
++		}
++		dmem := dsl.Head().ToSlice()
++		for p := uint64(0); p < basePages; p++ {
++			sink += dmem[p*pg] // fault base pages resident
++		}
++		clones = append(clones, dst)
++	}
++
++	rss := rollupKB(t, "Rss")
++	pss := rollupKB(t, "Pss")
++	sharedClean := rollupKB(t, "Shared_Clean")
++	privDirty := rollupKB(t, "Private_Dirty")
++
++	mib := func(kb uint64) float64 { return float64(kb) / 1024 }
++	t.Logf("flatten: base=%dMiB delta=%dMiB N=%d  (sink=%d)", baseMB, deltaMB, nClones, sink)
++	t.Logf("  Rss=%.0fMiB (would-be no-sharing footprint: ~N*(base+delta))", mib(rss))
++	t.Logf("  Pss=%.0fMiB (actual shared footprint: ~base + N*delta)", mib(pss))
++	t.Logf("  Shared_Clean=%.0fMiB  Private_Dirty=%.0fMiB", mib(sharedClean), mib(privDirty))
++	t.Logf("  Pss growth during restore = %.0fMiB", mib(pss-pssBefore))
++	if pss > 0 {
++		t.Logf("  FLATTEN (Rss/Pss) = %.1fx", float64(rss)/float64(pss))
++	}
++	expectNoShare := uint64(nClones) * (basePages + deltaPages) * pg
++	t.Logf("  theoretical: no-share=%.0fMiB  shared=%.0fMiB  ideal flatten=%.1fx",
++		mib(expectNoShare>>10), mib((basePages+uint64(nClones)*deltaPages)*pg>>10),
++		float64(expectNoShare)/float64((basePages+uint64(nClones)*deltaPages)*pg))
++
++	// Sanity: with N>=8 the base must be physically shared -> Pss well below Rss.
++	if nClones >= 8 && pss*2 >= rss {
++		t.Errorf("expected base sharing (Pss << Rss), got Rss=%dkB Pss=%dkB", rss, pss)
++	}
++	// Private dirty should be ~ N*delta (each clone COWs its own delta).
++	wantPrivMiB := float64(nClones * deltaMB)
++	if mib(privDirty) < wantPrivMiB*0.5 {
++		t.Errorf("Private_Dirty=%.0fMiB too low; expected ~%.0fMiB (N*delta)", mib(privDirty), wantPrivMiB)
++	}
++	for _, c := range clones {
++		c.Destroy()
++	}
++}
+diff --git a/pkg/sentry/pgalloc/pgalloc.go b/pkg/sentry/pgalloc/pgalloc.go
+index 43d9c4d8f..a47d7b528 100644
+--- a/pkg/sentry/pgalloc/pgalloc.go
++++ b/pkg/sentry/pgalloc/pgalloc.go
+@@ -23,6 +23,7 @@
+ package pgalloc
+ 
+ import (
++	"bytes"
+ 	"fmt"
+ 	"math"
+ 	"os"
+@@ -384,6 +385,14 @@ type MemoryFileOpts struct {
+ 	// If DisableMemoryAccounting is true, memory usage observed by the
+ 	// MemoryFile will not be reported in usage.MemoryAccounting.
+ 	DisableMemoryAccounting bool
++
++	// SharedBaseFile, if non-nil, backs the chunk range [0, SharedBaseBytes)
++	// with a MAP_PRIVATE mapping of this read-only file (GVISOR-3 shared
++	// copy-on-write base): resident base pages are physically shared across
++	// MemoryFiles using the same file, and writes fault to private copies.
++	// EXPERIMENTAL (S1): not yet integrated with restore/decommit/save.
++	SharedBaseFile  *os.File
++	SharedBaseBytes uint64
+ }
+ 
+ // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
+@@ -951,6 +960,34 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
+ 			m += chunkSize
+ 		}
+ 	}
++	// GVISOR-3 (S1): back base-range chunks with a MAP_PRIVATE mapping of the
++	// shared base file so resident base pages are shared copy-on-write across
++	// MemoryFiles and writes fault to private copies.
++	if f.opts.SharedBaseFile != nil {
++		for i := oldNrChunks; i < newNrChunks; i++ {
++			if newChunks[i].mapping == 0 {
++				continue
++			}
++			// Overlay the [0, SharedBaseBytes) portion of this chunk MAP_PRIVATE from
++			// the shared base file; any remainder stays MAP_SHARED on f.file. This
++			// shares sub-1-GiB bases too, since chunkSize is 1 GiB.
++			off := i * chunkSize
++			hi := off + chunkSize
++			if hi > f.opts.SharedBaseBytes {
++				hi = f.opts.SharedBaseBytes
++			}
++			if off >= hi {
++				continue
++			}
++			if _, _, errno := unix.Syscall6(unix.SYS_MMAP,
++				newChunks[i].mapping, uintptr(hi-off),
++				unix.PROT_READ|unix.PROT_WRITE,
++				unix.MAP_PRIVATE|unix.MAP_FIXED,
++				f.opts.SharedBaseFile.Fd(), uintptr(off)); errno != 0 {
++				return errno
++			}
++		}
++	}
+ 	f.chunks.Store(&newChunks)
+ 
+ 	// Mark void pages free.
+@@ -962,6 +999,102 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
+ 	return nil
+ }
+ 
++// ExportLinearBase writes the committed contents of the MemoryFile to out as a
++// sparse, guest-address-linear base image (out offset O == MemoryFile offset O),
++// usable as MemoryFileOpts.SharedBaseFile in other MemoryFiles (GVISOR-3 S2). The
++// backing memfd is already laid out linearly (chunk i at file offset i*chunkSize),
++// so only its data extents (SEEK_DATA/SEEK_HOLE) are copied and out stays sparse.
++func (f *MemoryFile) ExportLinearBase(out *os.File) (uint64, error) {
++	size := int64(uint64(len(f.chunksLoad())) * chunkSize)
++	if err := out.Truncate(size); err != nil {
++		return 0, err
++	}
++	infd, outfd := int(f.file.Fd()), int(out.Fd())
++	buf := make([]byte, 1<<20)
++	for off := int64(0); off < size; {
++		data, err := unix.Seek(infd, off, unix.SEEK_DATA)
++		if err != nil {
++			break
++		}
++		hole, err := unix.Seek(infd, data, unix.SEEK_HOLE)
++		if err != nil {
++			hole = size
++		}
++		for pos := data; pos < hole; {
++			n := int64(len(buf))
++			if hole-pos < n {
++				n = hole - pos
++			}
++			rn, rerr := unix.Pread(infd, buf[:n], pos)
++			if rn > 0 {
++				if _, werr := unix.Pwrite(outfd, buf[:rn], pos); werr != nil {
++					return 0, werr
++				}
++				pos += int64(rn)
++			}
++			if rerr != nil || rn == 0 {
++				break
++			}
++		}
++		off = hole
++	}
++	return uint64(size), nil
++}
++
++// BaseBackedRanges returns the committed page ranges in [0, baseBytes) whose
++// contents are byte-identical to the shared base file (GVISOR-3 F5: delta
++// computation). On checkpoint these pages need not be written to the pages file
++// (A6); on restore they are satisfied by the MAP_PRIVATE base mapping (S1/B1),
++// so both save and load must skip this set symmetrically. The complement of this
++// set within fs committed pages (plus any committed pages at or beyond
++// baseBytes) is the per-agent memory delta that must be saved and reloaded. The
++// returned ranges are coalesced and ascending. BaseBackedRanges is read-only
++// with respect to f.
++func (f *MemoryFile) BaseBackedRanges(base *os.File, baseBytes uint64) ([]memmap.FileRange, error) {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++	var out []memmap.FileRange
++	buf := make([]byte, hostarch.PageSize)
++	var loopErr error
++	addPage := func(off uint64) {
++		if n := len(out); n > 0 && out[n-1].End == off {
++			out[n-1].End = off + hostarch.PageSize
++		} else {
++			out = append(out, memmap.FileRange{off, off + hostarch.PageSize})
++		}
++	}
++	// Iterate accounted (allocated) ranges. knownCommitted is a lazy flag set by
++	// UpdateUsage, so it is not relied on here; comparing accounted page contents
++	// to the base is the source of truth for base-identity.
++	for maseg := f.memAcct.FirstSegment(); maseg.Ok(); maseg = maseg.NextSegment() {
++		fr := maseg.Range()
++		if fr.Start >= baseBytes {
++			continue // entirely beyond the base: all delta
++		}
++		if fr.End > baseBytes {
++			fr.End = baseBytes
++		}
++		f.forEachChunk(fr, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
++			bs := chunk.sliceAt(chunkFR)
++			for pgoff := 0; pgoff+hostarch.PageSize <= len(bs); pgoff += hostarch.PageSize {
++				off := chunkFR.Start + uint64(pgoff)
++				if _, err := base.ReadAt(buf, int64(off)); err != nil {
++					loopErr = err
++					return false
++				}
++				if bytes.Equal(bs[pgoff:pgoff+hostarch.PageSize], buf) {
++					addPage(off)
++				}
++			}
++			return true
++		})
++		if loopErr != nil {
++			return nil, loopErr
++		}
++	}
++	return out, nil
++}
++
+ func (f *MemoryFile) madviseChunkMapping(addr, len uintptr, huge bool) {
+ 	if huge {
+ 		if f.opts.AdviseHugepage {
+@@ -1132,6 +1265,31 @@ func (f *MemoryFile) manuallyZero(fr memmap.FileRange) {
+ }
+ 
+ func (f *MemoryFile) decommitOrManuallyZero(fr memmap.FileRange) {
++	// GVISOR-3 (A4): base-range pages are served by the MAP_PRIVATE base overlay,
++	// not by f.file. Drop them with MADV_DONTNEED, which frees any COW-dirty private
++	// copies and reverts the range to the shared base on next access; fallocate-
++	// punching f.file would not affect the overlay. Pages beyond the base (or with no
++	// base) are decommitted normally via f.file.
++	if f.opts.SharedBaseFile != nil && fr.Start < f.opts.SharedBaseBytes {
++		baseFR := fr
++		if baseFR.End > f.opts.SharedBaseBytes {
++			baseFR.End = f.opts.SharedBaseBytes
++		}
++		f.forEachChunk(baseFR, func(chunk *chunkInfo, chunkFR memmap.FileRange) bool {
++			if chunk.mapping == 0 {
++				return true
++			}
++			addr := chunk.mapping + uintptr(chunkFR.Start%chunkSize)
++			if _, _, errno := unix.Syscall(unix.SYS_MADVISE, addr, uintptr(chunkFR.Length()), unix.MADV_DONTNEED); errno != 0 {
++				log.Warningf("MADV_DONTNEED base range %v failed: %v", chunkFR, errno)
++			}
++			return true
++		})
++		if fr.End <= f.opts.SharedBaseBytes {
++			return
++		}
++		fr.Start = f.opts.SharedBaseBytes // decommit the beyond-base remainder below
++	}
+ 	if err := f.decommitFile(fr); err != nil {
+ 		log.Warningf("Failed to decommit %v: %v", fr, err)
+ 		// Zero the pages manually. This won't reduce memory usage, but at
+diff --git a/pkg/sentry/pgalloc/save_restore.go b/pkg/sentry/pgalloc/save_restore.go
+index 163ee5ff0..f95c26c6e 100644
+--- a/pkg/sentry/pgalloc/save_restore.go
++++ b/pkg/sentry/pgalloc/save_restore.go
+@@ -20,7 +20,9 @@ import (
+ 	"fmt"
+ 	"io"
+ 	"math"
++	"os"
+ 	"runtime"
++	"sort"
+ 	"sync/atomic"
+ 	"time"
+ 
+@@ -74,6 +76,11 @@ type memoryFileSaved struct {
+ 	subreleased  map[uint64]uint64
+ 	memAcct      *memAcctSet
+ 	chunks       []chunkInfo
++	// baseBacked records the page ranges (start->end) whose contents were
++	// identical to the shared base at save time and were therefore excluded
++	// from the pages file (GVISOR-3 A6); on restore they are served by the
++	// base mapping rather than reloaded. Empty/nil for base-less saves.
++	baseBacked map[uint64]uint64
+ }
+ 
+ // SaveOpts provides options to MemoryFile.SaveTo().
+@@ -93,6 +100,14 @@ type SaveOpts struct {
+ 	// but may instead improve SaveTo() and LoadFrom() time, and checkpoint
+ 	// size, if the application has many committed zero pages.
+ 	ExcludeCommittedZeroPages bool
++
++	// SharedBaseFile, if non-nil, is a read-only base image (in MemoryFile-offset
++	// layout, e.g. from ExportLinearBase) covering [0, SharedBaseBytes). Committed
++	// pages whose contents are identical to the base are EXCLUDED from the pages
++	// file (GVISOR-3 A6) and recorded in memoryFileSaved.baseBacked; on restore
++	// they are served by the shared base mapping rather than reloaded.
++	SharedBaseFile  *os.File
++	SharedBaseBytes uint64
+ }
+ 
+ // SaveTo writes f's state to the given stream.
+@@ -172,6 +187,20 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		}
+ 	}
+ 
++	// GVISOR-3 (A6): base-aware delta exclusion. When a base image is provided,
++	// committed pages whose contents equal the base are excluded from the pages
++	// file and recorded in baseBacked (start->end). recordBaseBacked receives a
++	// maximal contiguous base-backed run (the scan coalesces by page state).
++	baseFile := opts.SharedBaseFile
++	baseBytes := opts.SharedBaseBytes
++	baseBuf := make([]byte, hostarch.PageSize)
++	baseBacked := make(map[uint64]uint64)
++	recordBaseBacked := func(fr memmap.FileRange) {
++		if fr.Length() != 0 {
++			baseBacked[fr.Start] = fr.End
++		}
++	}
++
+ 	// Reading an uncommitted page to determine if it is zero-filled will cause
+ 	// it to become committed. Thus, we need to decommit zero-filled pages that
+ 	// were not previously known to be committed to avoid increasing memory
+@@ -227,8 +256,9 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		updatePendingFR           memmap.FileRange
+ 		updatePendingWasCommitted bool
+ 		updatePendingNowCommitted bool
++		updatePendingNowBase      bool
+ 	)
+-	updateNow := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted bool) memAcctIterator {
++	updateNow := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted, nowBase bool) memAcctIterator {
+ 		amount := fr.Length()
+ 		if amount == 0 {
+ 			return maseg
+@@ -254,19 +284,23 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 			maseg = f.memAcct.Unisolate(maseg)
+ 		}
+ 		if nowCommitted {
+-			asyncWritePages(fr)
++			if nowBase {
++				recordBaseBacked(fr)
++			} else {
++				asyncWritePages(fr)
++			}
+ 		}
+ 		return maseg
+ 	}
+ 	// Precondition: maseg.Range().IsSupersetOf(fr).
+ 	// Postcondition: The returned memAcctIterator.Range().IsSupersetOf(fr).
+-	updateAddRange := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted bool) memAcctIterator {
+-		if updatePendingFR.End == fr.Start && updatePendingWasCommitted == wasCommitted && updatePendingNowCommitted == nowCommitted {
++	updateAddRange := func(maseg memAcctIterator, fr memmap.FileRange, wasCommitted, nowCommitted, nowBase bool) memAcctIterator {
++		if updatePendingFR.End == fr.Start && updatePendingWasCommitted == wasCommitted && updatePendingNowCommitted == nowCommitted && updatePendingNowBase == nowBase {
+ 			updatePendingFR.End = fr.End
+ 			return maseg
+ 		}
+ 		if updatePendingFR.Length() != 0 {
+-			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted)
++			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted, updatePendingNowBase)
+ 			if maseg.End() == fr.Start {
+ 				maseg = maseg.NextSegment()
+ 			}
+@@ -274,11 +308,12 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		updatePendingFR = fr
+ 		updatePendingWasCommitted = wasCommitted
+ 		updatePendingNowCommitted = nowCommitted
++		updatePendingNowBase = nowBase
+ 		return maseg
+ 	}
+ 	updateFlush := func(maseg memAcctIterator) memAcctIterator {
+ 		if updatePendingFR.Length() != 0 {
+-			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted)
++			maseg = updateNow(maseg, updatePendingFR, updatePendingWasCommitted, updatePendingNowCommitted, updatePendingNowBase)
+ 		}
+ 		updatePendingFR = memmap.FileRange{}
+ 		return maseg
+@@ -315,9 +350,9 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		allocatedBytes += fr.Length()
+ 		ma.commitSeq = 0
+ 		wasCommitted := ma.knownCommitted
+-		if !opts.ExcludeCommittedZeroPages && wasCommitted {
++		if !opts.ExcludeCommittedZeroPages && wasCommitted && baseFile == nil {
+ 			alreadyCommittedBytes += fr.Length()
+-			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */)
++			maseg = updateAddRange(maseg, fr, true /* wasCommitted */, true /* nowCommitted */, false /* nowBase */)
+ 			maseg = updateFlush(maseg)
+ 			if maseg.End() == unscannedStart {
+ 				maseg = maseg.NextSegment()
+@@ -344,7 +379,13 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 						alreadyCommittedBytes += hostarch.PageSize
+ 					}
+ 				}
+-				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed)
++				isBase := false
++				if !isZeroed && baseFile != nil && off+hostarch.PageSize <= baseBytes {
++					if _, rerr := baseFile.ReadAt(baseBuf, int64(off)); rerr == nil {
++						isBase = bytes.Equal(pg, baseBuf)
++					}
++				}
++				maseg = updateAddRange(maseg, memmap.FileRange{off, off + hostarch.PageSize}, wasCommitted, !isZeroed, isBase)
+ 			}
+ 			// f.UpdateUsage() may be called concurrently with f.SaveTo();
+ 			// occasionally unlock f.mu to ensure that the former can promptly
+@@ -394,13 +435,16 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 		subreleased:  f.subreleased,
+ 		memAcct:      &f.memAcct,
+ 		chunks:       f.chunksLoad(),
++		baseBacked:   baseBacked,
+ 	}); err != nil {
+ 		return fmt.Errorf("failed to save metadata: %w", err)
+ 	}
+ 	log.Infof("MemoryFile(%p): saved metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
+ 
+ 	if amfs == nil {
+-		// Save committed pages.
++		// Save committed pages, excluding base-backed pages (GVISOR-3 A6) so the
++		// stream carries only the delta; symmetric with the load loop above.
++		baseBackedList := sortedRanges(baseBacked)
+ 		ww := wire.Writer{Writer: w}
+ 		timePagesStart := gohacks.Nanotime()
+ 		bytesSaved := uint64(0)
+@@ -408,21 +452,20 @@ func (f *MemoryFile) SaveTo(ctx context.Context, w io.Writer, opts *SaveOpts) er
+ 			if !maseg.ValuePtr().knownCommitted {
+ 				continue
+ 			}
+-			maFR := maseg.Range()
+-			// Write a header to distinguish from objects.
+-			if err := state.WriteHeader(&ww, maFR.Length(), false); err != nil {
+-				return err
+-			}
+-			// Write out data.
+-			var ioErr error
+-			f.forEachMappingSlice(maFR, func(s []byte) {
++			for _, dfr := range deltaSubRanges(maseg.Range(), baseBackedList) {
++				if err := state.WriteHeader(&ww, dfr.Length(), false); err != nil {
++					return err
++				}
++				var ioErr error
++				f.forEachMappingSlice(dfr, func(s []byte) {
++					if ioErr != nil {
++						return
++					}
++					_, ioErr = w.Write(s)
++				})
+ 				if ioErr != nil {
+-					return
++					return ioErr
+ 				}
+-				_, ioErr = w.Write(s)
+-			})
+-			if ioErr != nil {
+-				return ioErr
+ 			}
+ 		}
+ 		durPages := time.Duration(gohacks.Nanotime() - timePagesStart)
+@@ -920,6 +963,15 @@ type LoadOpts struct {
+ 	// ownership of this timeline remains in the hands of the caller of
+ 	// LoadFrom.
+ 	Timeline *timing.Timeline
++
++	// SharedBaseFile, if non-nil, is a read-only base image covering
++	// [0, SharedBaseBytes) (GVISOR-3 B1). On restore, that range is overlaid
++	// MAP_PRIVATE from this file so base-backed pages (memoryFileSaved.baseBacked)
++	// are served by the shared base copy-on-write; base-range delta pages COW the
++	// mapping when loaded. Requires the synchronous pages path (PagesFile nil) in
++	// this prototype (see finding F8: the async loader writes to the memfd FD).
++	SharedBaseFile  *os.File
++	SharedBaseBytes uint64
+ }
+ 
+ // LoadFrom loads MemoryFile state from the given stream.
+@@ -947,6 +999,12 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
+ 	f.memAcct.MoveFrom(mfs.memAcct)
+ 	chunks := mfs.chunks
+ 	f.chunks.Store(&chunks)
++	// GVISOR-3 (B1): base-backed ranges are excluded from the pages stream and
++	// served by the shared base overlay below; both load loops skip them.
++	baseBackedList := sortedRanges(mfs.baseBacked)
++	if len(mfs.baseBacked) != 0 && opts.SharedBaseFile == nil {
++		return fmt.Errorf("checkpoint has %d base-backed ranges but no SharedBaseFile was provided", len(mfs.baseBacked))
++	}
+ 	mfTimeline.Reached("metadata loaded")
+ 	log.Infof("MemoryFile(%p): loaded metadata in %s", f, time.Duration(gohacks.Nanotime()-timeMetadataStart))
+ 
+@@ -973,11 +1031,35 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
+ 			return fmt.Errorf("failed to mmap MemoryFile: %w", errno)
+ 		}
+ 		mfTimeline.Reached("mmaped chunks")
++		mapStart := m
+ 		for i := range chunks {
+ 			chunk := &chunks[i]
+ 			chunk.mapping = m
+ 			m += chunkSize
+ 		}
++		// GVISOR-3 (B1/F8): overlay [0, SharedBaseBytes) of the restore mapping
++		// MAP_PRIVATE from the shared base, so base-backed pages are served by the
++		// shared base (copy-on-write) instead of the per-sandbox memfd, and
++		// base-range delta pages COW the mapping when written below.
++		if opts.SharedBaseFile != nil {
++			hi := opts.SharedBaseBytes
++			if hi > fileSize {
++				hi = fileSize
++			}
++			if hi > 0 {
++				if _, _, errno := unix.Syscall6(unix.SYS_MMAP,
++					mapStart, uintptr(hi),
++					unix.PROT_READ|unix.PROT_WRITE,
++					unix.MAP_PRIVATE|unix.MAP_FIXED,
++					opts.SharedBaseFile.Fd(), 0); errno != 0 {
++					return fmt.Errorf("failed to overlay shared base: %w", errno)
++				}
++			}
++			// Record the base range on f so Decommit/accounting (A4/A5) treat the
++			// base range as overlay-backed (MADV_DONTNEED), not f.file-backed.
++			f.opts.SharedBaseFile = opts.SharedBaseFile
++			f.opts.SharedBaseBytes = opts.SharedBaseBytes
++		}
+ 		madviseWG.Add(1)
+ 		go func() {
+ 			defer madviseWG.Done()
+@@ -1062,42 +1144,48 @@ func (f *MemoryFile) LoadFrom(ctx context.Context, r io.Reader, opts *LoadOpts)
+ 			<-madviseChan
+ 		}
+ 		if amfl != nil {
+-			// Record where to read data.
+-			if !minUnloadedInit {
+-				minUnloadedInit = true
+-				amfl.minUnloaded.Store(maFR.Start)
++			// Record where to read data for each delta sub-range; base-backed
++			// pages are served by the MAP_PRIVATE base overlay (GVISOR-3 B1/B2)
++			// and are absent from the pages file, so skip them symmetrically with
++			// save. The async loader reads each range into the mapping memory,
++			// COWing the base overlay for base-range delta pages.
++			for _, dfr := range deltaSubRanges(maFR, baseBackedList) {
++				if !minUnloadedInit {
++					minUnloadedInit = true
++					amfl.minUnloaded.Store(dfr.Start)
++				}
++				amfl.pf.mu.Lock()
++				amfl.unloaded.InsertRange(dfr, aplUnloadedInfo{
++					off: opts.PagesFileOffset,
++				})
++				amfl.pf.mu.Unlock()
++				opts.PagesFileOffset += dfr.Length()
++				amfl.pf.lfStatus.Notify(aplLFPending)
+ 			}
+-			amfl.pf.mu.Lock()
+-			amfl.unloaded.InsertRange(maFR, aplUnloadedInfo{
+-				off: opts.PagesFileOffset,
+-			})
+-			amfl.pf.mu.Unlock()
+-			opts.PagesFileOffset += amount
+-			amfl.pf.lfStatus.Notify(aplLFPending)
+ 		} else {
+-			// Verify header.
+-			length, object, err := state.ReadHeader(&wr)
+-			if err != nil {
+-				return fmt.Errorf("failed to read header: %w", err)
+-			}
+-			if object {
+-				// Not expected.
+-				return fmt.Errorf("unexpected object")
+-			}
+-			if length != amount {
+-				// Size mismatch.
+-				return fmt.Errorf("mismatched segment: expected %d, got %d", amount, length)
+-			}
+-			// Read data.
+-			var ioErr error
+-			f.forEachMappingSlice(maFR, func(s []byte) {
++			// Read each delta sub-range (base-backed pages are skipped; their
++			// content comes from the MAP_PRIVATE base overlay).
++			for _, dfr := range deltaSubRanges(maFR, baseBackedList) {
++				length, object, err := state.ReadHeader(&wr)
++				if err != nil {
++					return fmt.Errorf("failed to read header: %w", err)
++				}
++				if object {
++					return fmt.Errorf("unexpected object")
++				}
++				if length != dfr.Length() {
++					return fmt.Errorf("mismatched segment: expected %d, got %d", dfr.Length(), length)
++				}
++				var ioErr error
++				f.forEachMappingSlice(dfr, func(s []byte) {
++					if ioErr != nil {
++						return
++					}
++					_, ioErr = io.ReadFull(r, s)
++				})
+ 				if ioErr != nil {
+-					return
++					return fmt.Errorf("failed to read pages: %w", ioErr)
+ 				}
+-				_, ioErr = io.ReadFull(r, s)
+-			})
+-			if ioErr != nil {
+-				return fmt.Errorf("failed to read pages: %w", ioErr)
+ 			}
+ 		}
+ 
+@@ -2009,3 +2097,47 @@ func (f *MemoryFile) getClientFileRangeSettings(fileSize uint64) []stateio.Clien
+ 	})
+ 	return cfrs
+ }
++
++// sortedRanges converts a start->end map (e.g. memoryFileSaved.baseBacked) into a
++// slice of FileRanges sorted ascending by Start (GVISOR-3).
++func sortedRanges(m map[uint64]uint64) []memmap.FileRange {
++	if len(m) == 0 {
++		return nil
++	}
++	out := make([]memmap.FileRange, 0, len(m))
++	for st, en := range m {
++		out = append(out, memmap.FileRange{Start: st, End: en})
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i].Start < out[j].Start })
++	return out
++}
++
++// deltaSubRanges returns the sub-ranges of seg not covered by any range in bb
++// (bb sorted ascending, non-overlapping). With bb empty it returns [seg], so the
++// non-base save/restore wire format is unchanged (GVISOR-3 B1).
++func deltaSubRanges(seg memmap.FileRange, bb []memmap.FileRange) []memmap.FileRange {
++	if len(bb) == 0 {
++		return []memmap.FileRange{seg}
++	}
++	var out []memmap.FileRange
++	cur := seg.Start
++	for _, r := range bb {
++		if r.End <= cur || r.Start >= seg.End {
++			continue
++		}
++		st := r.Start
++		if st < cur {
++			st = cur
++		}
++		if st > cur {
++			out = append(out, memmap.FileRange{Start: cur, End: st})
++		}
++		if r.End > cur {
++			cur = r.End
++		}
++	}
++	if cur < seg.End {
++		out = append(out, memmap.FileRange{Start: cur, End: seg.End})
++	}
++	return out
++}
+diff --git a/pkg/sentry/pgalloc/saverestore_test.go b/pkg/sentry/pgalloc/saverestore_test.go
+new file mode 100644
+index 000000000..e1d623fba
+--- /dev/null
++++ b/pkg/sentry/pgalloc/saverestore_test.go
+@@ -0,0 +1,459 @@
++// Copyright 2024 The gVisor Authors.
++// LLIFS GVISOR-3 B1: SaveTo->LoadFrom round-trip harness. This is the enabling
++// test for the base/delta split: it drives the REAL pgalloc save/restore path
++// (packed pages file via stateio + stateify metadata) end to end, so subsequent
++// base-backed-skip changes to SaveTo/LoadFrom can be verified here.
++package pgalloc
++
++import (
++	"bytes"
++	"os"
++	"sync"
++	"syscall"
++	"testing"
++
++	"gvisor.dev/gvisor/pkg/context"
++	"gvisor.dev/gvisor/pkg/hostarch"
++	"gvisor.dev/gvisor/pkg/sentry/state/stateio"
++	"gvisor.dev/gvisor/pkg/state"
++)
++
++func mkMemFile(t *testing.T, opts MemoryFileOpts) *MemoryFile {
++	t.Helper()
++	b, err := os.CreateTemp("", "llifs-mf-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	os.Remove(b.Name())
++	f, err := NewMemoryFile(b, opts)
++	if err != nil {
++		t.Fatal(err)
++	}
++	return f
++}
++
++func TestSaveRestoreRoundTrip(t *testing.T) {
++	ctx := context.Background()
++	pg := uint64(hostarch.PageSize)
++	const npages = 16
++
++	src := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
++	defer src.Destroy()
++	fr, err := src.Allocate(npages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ssl, err := src.MapInternal(fr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	smem := ssl.Head().ToSlice()
++	val := func(p int) byte {
++		if p == 7 {
++			return 0 // a committed zero page, to exercise zero-exclusion
++		}
++		return byte(p*13 + 1)
++	}
++	for p := 0; p < npages; p++ {
++		for i := 0; i < int(pg); i++ {
++			smem[p*int(pg)+i] = val(p)
++		}
++	}
++
++	// Pages file: use raw fds so the writer/reader own them (no os.File finalizer
++	// double-close), reopening the same path for the read side.
++	tmp, err := os.CreateTemp("", "llifs-pages-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	pfName := tmp.Name()
++	tmp.Close()
++	defer os.Remove(pfName)
++
++	// --- SAVE ---
++	wfd, err := syscall.Open(pfName, syscall.O_RDWR|syscall.O_TRUNC, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	aw := stateio.NewPagesFileFDWriterDefault(int32(wfd)) // takes ownership of wfd
++	var swg sync.WaitGroup
++	var saveErr error
++	swg.Add(1)
++	apfs, err := StartAsyncPagesFileSave(aw, func(e error) { saveErr = e; swg.Done() })
++	if err != nil {
++		t.Fatal(err)
++	}
++	var meta bytes.Buffer
++	if err := src.SaveTo(ctx, &meta, &SaveOpts{PagesFile: apfs, ExcludeCommittedZeroPages: true}); err != nil {
++		t.Fatalf("SaveTo: %v", err)
++	}
++	apfs.MemoryFilesDone()
++	swg.Wait()
++	if saveErr != nil {
++		t.Fatalf("async page save: %v", saveErr)
++	}
++
++	// --- LOAD ---
++	rfd, err := syscall.Open(pfName, syscall.O_RDONLY, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ar := stateio.NewPagesFileFDReaderDefault(int32(rfd)) // takes ownership of rfd
++	var lwg sync.WaitGroup
++	var loadErr error
++	lwg.Add(1)
++	apfl, err := StartAsyncPagesFileLoad(ar, func(e error) { loadErr = e; lwg.Done() }, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	dst := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
++	defer dst.Destroy()
++	if err := dst.LoadFrom(ctx, bytes.NewReader(meta.Bytes()), &LoadOpts{PagesFile: apfl}); err != nil {
++		t.Fatalf("LoadFrom: %v", err)
++	}
++	apfl.MemoryFilesDone()
++	if err := dst.AwaitLoadAll(); err != nil {
++		t.Fatalf("AwaitLoadAll: %v", err)
++	}
++	lwg.Wait()
++	if loadErr != nil {
++		t.Fatalf("async page load: %v", loadErr)
++	}
++
++	// --- COMPARE ---
++	dsl, err := dst.MapInternal(fr, hostarch.Read)
++	if err != nil {
++		t.Fatalf("dst MapInternal: %v", err)
++	}
++	dmem := dsl.Head().ToSlice()
++	for p := 0; p < npages; p++ {
++		want := val(p)
++		for i := 0; i < int(pg); i++ {
++			if dmem[p*int(pg)+i] != want {
++				t.Fatalf("restored page %d byte %d: got %#x want %#x", p, i, dmem[p*int(pg)+i], want)
++			}
++		}
++	}
++}
++
++// TestSaveWithBaseExcludesDelta verifies A6: when a base image is supplied to
++// SaveTo, committed pages identical to the base are excluded from the pages file
++// and recorded in memoryFileSaved.baseBacked; only the delta is written.
++func TestSaveWithBaseExcludesDelta(t *testing.T) {
++	ctx := context.Background()
++	pg := uint64(hostarch.PageSize)
++	const npages, ndelta = 16, 3
++
++	src := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
++	defer src.Destroy()
++	fr, err := src.Allocate(npages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ssl, err := src.MapInternal(fr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	smem := ssl.Head().ToSlice()
++	for p := 0; p < npages; p++ {
++		for i := 0; i < int(pg); i++ {
++			smem[p*int(pg)+i] = byte(p*13 + 1) // all non-zero, distinct
++		}
++	}
++
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	bsz, err := src.ExportLinearBase(base)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Modify ndelta pages AFTER export -> these are the only pages that must be
++	// written when saving against the base.
++	for _, p := range []int{2, 8, 13} {
++		smem[p*int(pg)] ^= 0xFF
++	}
++
++	doSave := func(useBase bool) (uint64, []byte) {
++		tmp, err := os.CreateTemp("", "llifs-pages-*")
++		if err != nil {
++			t.Fatal(err)
++		}
++		name := tmp.Name()
++		tmp.Close()
++		defer os.Remove(name)
++		wfd, err := syscall.Open(name, syscall.O_RDWR|syscall.O_TRUNC, 0)
++		if err != nil {
++			t.Fatal(err)
++		}
++		aw := stateio.NewPagesFileFDWriterDefault(int32(wfd))
++		var wg sync.WaitGroup
++		var serr error
++		wg.Add(1)
++		apfs, err := StartAsyncPagesFileSave(aw, func(e error) { serr = e; wg.Done() })
++		if err != nil {
++			t.Fatal(err)
++		}
++		so := &SaveOpts{PagesFile: apfs, ExcludeCommittedZeroPages: true}
++		if useBase {
++			so.SharedBaseFile = base
++			so.SharedBaseBytes = bsz
++		}
++		var meta bytes.Buffer
++		if err := src.SaveTo(ctx, &meta, so); err != nil {
++			t.Fatalf("SaveTo: %v", err)
++		}
++		off := apfs.PagesFileOffset()
++		apfs.MemoryFilesDone()
++		wg.Wait()
++		if serr != nil {
++			t.Fatalf("async save: %v", serr)
++		}
++		return off, meta.Bytes()
++	}
++
++	offNoBase, _ := doSave(false)
++	offBase, metaBase := doSave(true)
++
++	if offNoBase != npages*pg {
++		t.Errorf("no-base pages file: got %d bytes, want %d (%d pages)", offNoBase, npages*pg, npages)
++	}
++	if offBase != ndelta*pg {
++		t.Errorf("with-base pages file: got %d bytes, want %d (%d delta pages)", offBase, ndelta*pg, ndelta)
++	}
++
++	var mfs memoryFileSaved
++	if _, err := state.Load(ctx, bytes.NewReader(metaBase), &mfs); err != nil {
++		t.Fatalf("load metadata: %v", err)
++	}
++	var bbPages uint64
++	for st, en := range mfs.baseBacked {
++		bbPages += (en - st) / pg
++	}
++	if bbPages != npages-ndelta {
++		t.Errorf("baseBacked pages: got %d, want %d", bbPages, npages-ndelta)
++	}
++}
++
++// TestRestoreOverBase proves the B1 load side: save against a base (delta-only
++// stream) then restore with the base overlaid MAP_PRIVATE. Base-backed pages must
++// read base content (which is non-zero, so it cannot have come from the fresh memfd
++// or the delta-only stream -- only the overlay), delta pages must read delta
++// content (COW-applied over the mapping), and the base file must stay unmodified.
++func TestRestoreOverBase(t *testing.T) {
++	ctx := context.Background()
++	pg := uint64(hostarch.PageSize)
++	const npages = 16
++	deltaPages := map[int]byte{2: 0x22, 8: 0x88, 13: 0xDD}
++	baseVal := func(p int) byte { return byte(p*13 + 1) } // non-zero, distinct
++
++	src := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
++	defer src.Destroy()
++	fr, err := src.Allocate(npages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ssl, err := src.MapInternal(fr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	smem := ssl.Head().ToSlice()
++	for p := 0; p < npages; p++ {
++		for i := 0; i < int(pg); i++ {
++			smem[p*int(pg)+i] = baseVal(p)
++		}
++	}
++
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	bsz, err := src.ExportLinearBase(base)
++	if err != nil {
++		t.Fatal(err)
++	}
++	// Apply delta AFTER export.
++	for p, v := range deltaPages {
++		for i := 0; i < int(pg); i++ {
++			smem[p*int(pg)+i] = v
++		}
++	}
++
++	// SAVE against the base, synchronous (PagesFile nil) -> stream holds only delta.
++	var meta bytes.Buffer
++	if err := src.SaveTo(ctx, &meta, &SaveOpts{ExcludeCommittedZeroPages: true, SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
++		t.Fatalf("SaveTo: %v", err)
++	}
++
++	// RESTORE with the base overlaid.
++	dst := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
++	defer dst.Destroy()
++	if err := dst.LoadFrom(ctx, bytes.NewReader(meta.Bytes()), &LoadOpts{SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
++		t.Fatalf("LoadFrom: %v", err)
++	}
++
++	dsl, err := dst.MapInternal(fr, hostarch.Read)
++	if err != nil {
++		t.Fatalf("dst MapInternal: %v", err)
++	}
++	dmem := dsl.Head().ToSlice()
++	for p := 0; p < npages; p++ {
++		want := baseVal(p)
++		if v, ok := deltaPages[p]; ok {
++			want = v
++		}
++		for i := 0; i < int(pg); i++ {
++			if got := dmem[p*int(pg)+i]; got != want {
++				t.Fatalf("restored page %d byte %d: got %#x want %#x (delta=%v)", p, i, got, want, deltaPages[p] != 0)
++			}
++		}
++	}
++
++	// COW isolation: the base file must be untouched at delta offsets.
++	chk := make([]byte, 1)
++	for p := range deltaPages {
++		if _, err := base.ReadAt(chk, int64(fr.Start)+int64(uint64(p)*pg)); err != nil {
++			t.Fatal(err)
++		}
++		if chk[0] != baseVal(p) {
++			t.Fatalf("base file mutated at page %d: got %#x want %#x", p, chk[0], baseVal(p))
++		}
++	}
++}
++
++// TestRestoreOverBaseAsync is TestRestoreOverBase via the ASYNC pages-file path
++// (what runsc uses): save against a base writing only the delta to an stateio FD
++// pages file, then restore with that pages file AND the base overlaid. Proves B2 --
++// the async loader reads delta into the (overlaid) mapping, COWing base-range pages.
++func TestRestoreOverBaseAsync(t *testing.T) {
++	ctx := context.Background()
++	pg := uint64(hostarch.PageSize)
++	const npages = 16
++	deltaPages := map[int]byte{2: 0x22, 8: 0x88, 13: 0xDD}
++	baseVal := func(p int) byte { return byte(p*13 + 1) }
++
++	src := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
++	defer src.Destroy()
++	fr, err := src.Allocate(npages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ssl, err := src.MapInternal(fr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	smem := ssl.Head().ToSlice()
++	for p := 0; p < npages; p++ {
++		for i := 0; i < int(pg); i++ {
++			smem[p*int(pg)+i] = baseVal(p)
++		}
++	}
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	bsz, err := src.ExportLinearBase(base)
++	if err != nil {
++		t.Fatal(err)
++	}
++	for p, v := range deltaPages {
++		for i := 0; i < int(pg); i++ {
++			smem[p*int(pg)+i] = v
++		}
++	}
++
++	tmp, err := os.CreateTemp("", "llifs-pages-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	pfName := tmp.Name()
++	tmp.Close()
++	defer os.Remove(pfName)
++
++	// SAVE (async pages file) against the base.
++	wfd, err := syscall.Open(pfName, syscall.O_RDWR|syscall.O_TRUNC, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	aw := stateio.NewPagesFileFDWriterDefault(int32(wfd))
++	var swg sync.WaitGroup
++	var serr error
++	swg.Add(1)
++	apfs, err := StartAsyncPagesFileSave(aw, func(e error) { serr = e; swg.Done() })
++	if err != nil {
++		t.Fatal(err)
++	}
++	var meta bytes.Buffer
++	if err := src.SaveTo(ctx, &meta, &SaveOpts{PagesFile: apfs, ExcludeCommittedZeroPages: true, SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
++		t.Fatalf("SaveTo: %v", err)
++	}
++	deltaBytes := apfs.PagesFileOffset()
++	apfs.MemoryFilesDone()
++	swg.Wait()
++	if serr != nil {
++		t.Fatalf("async save: %v", serr)
++	}
++	if deltaBytes != uint64(len(deltaPages))*pg {
++		t.Fatalf("pages file: got %d bytes, want %d (delta only)", deltaBytes, uint64(len(deltaPages))*pg)
++	}
++
++	// RESTORE (async pages file) with the base overlaid.
++	rfd, err := syscall.Open(pfName, syscall.O_RDONLY, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ar := stateio.NewPagesFileFDReaderDefault(int32(rfd))
++	var lwg sync.WaitGroup
++	var lerr error
++	lwg.Add(1)
++	apfl, err := StartAsyncPagesFileLoad(ar, func(e error) { lerr = e; lwg.Done() }, nil)
++	if err != nil {
++		t.Fatal(err)
++	}
++	dst := mkMemFile(t, MemoryFileOpts{DisableMemoryAccounting: true})
++	defer dst.Destroy()
++	if err := dst.LoadFrom(ctx, bytes.NewReader(meta.Bytes()), &LoadOpts{PagesFile: apfl, SharedBaseFile: base, SharedBaseBytes: bsz}); err != nil {
++		t.Fatalf("LoadFrom: %v", err)
++	}
++	apfl.MemoryFilesDone()
++	if err := dst.AwaitLoadAll(); err != nil {
++		t.Fatalf("AwaitLoadAll: %v", err)
++	}
++	lwg.Wait()
++	if lerr != nil {
++		t.Fatalf("async load: %v", lerr)
++	}
++
++	dsl, err := dst.MapInternal(fr, hostarch.Read)
++	if err != nil {
++		t.Fatalf("dst MapInternal: %v", err)
++	}
++	dmem := dsl.Head().ToSlice()
++	for p := 0; p < npages; p++ {
++		want := baseVal(p)
++		if v, ok := deltaPages[p]; ok {
++			want = v
++		}
++		for i := 0; i < int(pg); i++ {
++			if got := dmem[p*int(pg)+i]; got != want {
++				t.Fatalf("restored page %d byte %d: got %#x want %#x", p, i, got, want)
++			}
++		}
++	}
++	chk := make([]byte, 1)
++	for p := range deltaPages {
++		if _, err := base.ReadAt(chk, int64(fr.Start)+int64(uint64(p)*pg)); err != nil {
++			t.Fatal(err)
++		}
++		if chk[0] != baseVal(p) {
++			t.Fatalf("base file mutated at page %d", p)
++		}
++	}
++}
+diff --git a/pkg/sentry/pgalloc/sharedbase_test.go b/pkg/sentry/pgalloc/sharedbase_test.go
+new file mode 100644
+index 000000000..0788b055b
+--- /dev/null
++++ b/pkg/sentry/pgalloc/sharedbase_test.go
+@@ -0,0 +1,389 @@
++// Copyright 2024 The gVisor Authors.
++// LLIFS GVISOR-3 S1b: copy-on-write semantics of a shared base file.
++package pgalloc
++
++import (
++	"bytes"
++	"os"
++	"testing"
++
++	"gvisor.dev/gvisor/pkg/hostarch"
++	"gvisor.dev/gvisor/pkg/sentry/memmap"
++)
++
++func TestSharedBaseCOW(t *testing.T) {
++	const baseLen = 4 << 20 // 4 MiB, well under the 1 GiB chunk -> exercises finer mapping
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	pat := make([]byte, baseLen)
++	for i := range pat {
++		pat[i] = byte(i*131 + 7)
++	}
++	if _, err := base.WriteAt(pat, 0); err != nil {
++		t.Fatal(err)
++	}
++
++	mk := func() *MemoryFile {
++		b, err := os.CreateTemp("", "llifs-backing-*")
++		if err != nil {
++			t.Fatal(err)
++		}
++		os.Remove(b.Name())
++		f, err := NewMemoryFile(b, MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: baseLen})
++		if err != nil {
++			t.Fatal(err)
++		}
++		return f
++	}
++	rd := func(f *MemoryFile, fr memmap.FileRange, n int) []byte {
++		bs, err := f.MapInternal(fr, hostarch.Read)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return append([]byte(nil), bs.Head().ToSlice()[:n]...)
++	}
++
++	f1 := mk()
++	defer f1.Destroy()
++	fr1, err := f1.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if fr1.Start >= baseLen {
++		t.Fatalf("allocation landed outside base range: %v", fr1)
++	}
++	if got := rd(f1, fr1, 64); !bytes.Equal(got, pat[fr1.Start:fr1.Start+64]) {
++		t.Fatalf("base-backed read mismatch at off %d: got %x want %x", fr1.Start, got, pat[fr1.Start:fr1.Start+64])
++	}
++
++	f2 := mk()
++	defer f2.Destroy()
++	fr2, err := f2.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := rd(f2, fr2, 64); !bytes.Equal(got, pat[fr2.Start:fr2.Start+64]) {
++		t.Fatalf("second MemoryFile base read mismatch")
++	}
++
++	// Copy-on-write: write through f1; the base file and f2 stay unchanged, f1 sees it.
++	bs, err := f1.MapInternal(fr1, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := ^pat[fr1.Start]
++	bs.Head().ToSlice()[0] = want
++	chk := make([]byte, 1)
++	if _, err := base.ReadAt(chk, int64(fr1.Start)); err != nil {
++		t.Fatal(err)
++	}
++	if chk[0] != pat[fr1.Start] {
++		t.Fatalf("base FILE mutated by a private write: %x", chk[0])
++	}
++	if got := rd(f2, fr2, 1); got[0] != pat[fr2.Start] {
++		t.Fatalf("f2 observed f1 private write (no isolation)")
++	}
++	if got := rd(f1, fr1, 1); got[0] != want {
++		t.Fatalf("f1 did not observe its own write: %x", got[0])
++	}
++}
++
++func TestExportLinearBaseAndShare(t *testing.T) {
++	mkMF := func(opts MemoryFileOpts) *MemoryFile {
++		b, err := os.CreateTemp("", "llifs-mf-*")
++		if err != nil {
++			t.Fatal(err)
++		}
++		os.Remove(b.Name())
++		f, err := NewMemoryFile(b, opts)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return f
++	}
++
++	src := mkMF(MemoryFileOpts{})
++	defer src.Destroy()
++	fr, err := src.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	bs, err := src.MapInternal(fr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pat := make([]byte, 256)
++	for i := range pat {
++		pat[i] = byte(i*7 + 3)
++	}
++	copy(bs.Head().ToSlice(), pat)
++
++	out, err := os.CreateTemp("", "llifs-exported-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(out.Name())
++	defer out.Close()
++	exSize, err := src.ExportLinearBase(out)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if exSize == 0 {
++		t.Fatal("export produced empty size")
++	}
++	chk := make([]byte, len(pat))
++	if _, err := out.ReadAt(chk, int64(fr.Start)); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(chk, pat) {
++		t.Fatalf("exported base content mismatch at off %d", fr.Start)
++	}
++
++	// S2 -> S1: the exported file works as a shared base.
++	dst := mkMF(MemoryFileOpts{SharedBaseFile: out, SharedBaseBytes: exSize})
++	defer dst.Destroy()
++	fr2, err := dst.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	bs2, err := dst.MapInternal(fr2, hostarch.Read)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := bs2.Head().ToSlice()[:len(pat)]; !bytes.Equal(got, pat) {
++		t.Fatalf("shared base from export mismatch at fr2=%v", fr2)
++	}
++}
++
++// TestBasePlusDeltaRestore proves the S3 restore-apply mechanism (ledger F4):
++// map a shared base, then WRITE the per-agent delta pages over it (COW), yielding
++// a base+delta view with isolation -- without touching the base file or peers.
++func TestBasePlusDeltaRestore(t *testing.T) {
++	pg := int(hostarch.PageSize)
++	mkMF := func(opts MemoryFileOpts) *MemoryFile {
++		b, err := os.CreateTemp("", "llifs-mf-*")
++		if err != nil {
++			t.Fatal(err)
++		}
++		os.Remove(b.Name())
++		f, err := NewMemoryFile(b, opts)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return f
++	}
++
++	// Base: page0=0xAA, page1=0xBB.
++	src := mkMF(MemoryFileOpts{})
++	defer src.Destroy()
++	sfr, err := src.Allocate(uint64(2*pg), AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ssl, err := src.MapInternal(sfr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	sb := ssl.Head().ToSlice()
++	sb[0] = 0xAA
++	sb[pg] = 0xBB
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	exSize, err := src.ExportLinearBase(base)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// Clone A: map base, then apply a delta (page1 -> 0xCC) by writing over it.
++	a := mkMF(MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: exSize})
++	defer a.Destroy()
++	afr, err := a.Allocate(uint64(2*pg), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	asl, err := a.MapInternal(afr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ab := asl.Head().ToSlice()
++	if ab[0] != 0xAA || ab[pg] != 0xBB {
++		t.Fatalf("clone A pre-delta should read base: %x %x", ab[0], ab[pg])
++	}
++	ab[pg] = 0xCC // delta apply (COW)
++	if ab[0] != 0xAA || ab[pg] != 0xCC {
++		t.Fatalf("clone A post-delta want AA,CC got %x,%x", ab[0], ab[pg])
++	}
++
++	// Base file must be unchanged by the delta.
++	chk := make([]byte, 1)
++	if _, err := base.ReadAt(chk, int64(sfr.Start)+int64(pg)); err != nil {
++		t.Fatal(err)
++	}
++	if chk[0] != 0xBB {
++		t.Fatalf("base file mutated by clone A delta: %x", chk[0])
++	}
++
++	// Clone B: same base, NO delta -> pure base (page1 still 0xBB), isolated from A.
++	b := mkMF(MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: exSize})
++	defer b.Destroy()
++	bfr, err := b.Allocate(uint64(2*pg), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	bsl, err := b.MapInternal(bfr, hostarch.Read)
++	if err != nil {
++		t.Fatal(err)
++	}
++	bb := bsl.Head().ToSlice()
++	if bb[0] != 0xAA || bb[pg] != 0xBB {
++		t.Fatalf("clone B (no delta) want AA,BB got %x,%x", bb[0], bb[pg])
++	}
++}
++
++// TestBaseBackedRangesDelta validates the F5 delta computation: of N committed
++// pages filled to match a base, only the pages modified AFTER export are reported
++// as delta; the rest are base-backed (skippable on save, base-mapped on restore).
++func TestBaseBackedRangesDelta(t *testing.T) {
++	pg := uint64(hostarch.PageSize)
++	b, err := os.CreateTemp("", "llifs-mf-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	os.Remove(b.Name())
++	src, err := NewMemoryFile(b, MemoryFileOpts{})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer src.Destroy()
++
++	const npages = 8
++	fr, err := src.Allocate(npages*pg, AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	sl, err := src.MapInternal(fr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	mem := sl.Head().ToSlice()
++	for p := 0; p < npages; p++ {
++		for i := 0; i < int(pg); i++ {
++			mem[p*int(pg)+i] = byte(p*7 + 1) // distinct, non-zero per page
++		}
++	}
++
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	bsz, err := src.ExportLinearBase(base)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// Modify pages 2 and 5 AFTER export: these become the delta.
++	mem[2*int(pg)] ^= 0xFF
++	mem[5*int(pg)+10] ^= 0xFF
++
++	bb, err := src.BaseBackedRanges(base, bsz)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var bbPages uint64
++	for _, r := range bb {
++		bbPages += r.Length() / pg
++	}
++	if bbPages != npages-2 {
++		t.Fatalf("want %d base-backed pages, got %d (%v)", npages-2, bbPages, bb)
++	}
++	covered := func(off uint64) bool {
++		for _, r := range bb {
++			if off >= r.Start && off < r.End {
++				return true
++			}
++		}
++		return false
++	}
++	if covered(fr.Start+2*pg) || covered(fr.Start+5*pg) {
++		t.Fatalf("a delta page was wrongly marked base-backed: %v", bb)
++	}
++	if !covered(fr.Start+0*pg) || !covered(fr.Start+7*pg) {
++		t.Fatalf("an unmodified base page is missing from base-backed set: %v", bb)
++	}
++}
++
++// TestBaseDecommitRevertsToBase validates A4: decommitting a COW-written base-range
++// page MADV_DONTNEEDs the overlay (reverting it to the shared base) rather than
++// fallocate-punching f.file (which would not touch the overlay -> the written value
++// would wrongly persist).
++func TestBaseDecommitRevertsToBase(t *testing.T) {
++	pg := uint64(hostarch.PageSize)
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	page0 := make([]byte, pg)
++	page1 := make([]byte, pg)
++	for i := range page0 {
++		page0[i] = 0xAA
++		page1[i] = 0xBB
++	}
++	base.WriteAt(page0, 0)
++	base.WriteAt(page1, int64(pg))
++
++	b, err := os.CreateTemp("", "llifs-backing-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	os.Remove(b.Name())
++	mf, err := NewMemoryFile(b, MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: 2 * pg, DisableMemoryAccounting: true})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer mf.Destroy()
++	fr, err := mf.Allocate(2*pg, AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	sl, err := mf.MapInternal(fr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	mem := sl.Head().ToSlice()
++	if mem[0] != 0xAA || mem[pg] != 0xBB {
++		t.Fatalf("base overlay not in effect: %#x %#x", mem[0], mem[pg])
++	}
++	mem[0] = 0x11 // COW-write page0 -> private dirty
++	if mem[0] != 0x11 {
++		t.Fatalf("COW write not visible: %#x", mem[0])
++	}
++
++	// Decommit page0: should drop the COW copy and revert to the shared base.
++	mf.Decommit(memmap.FileRange{Start: fr.Start, End: fr.Start + pg})
++
++	sl2, err := mf.MapInternal(memmap.FileRange{Start: fr.Start, End: fr.Start + pg}, hostarch.Read)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := sl2.Head().ToSlice()[0]; got != 0xAA {
++		t.Fatalf("decommit did not revert base page to shared base: got %#x want 0xAA (fallocate-punch no-op bug?)", got)
++	}
++	// The base file itself must be untouched.
++	chk := make([]byte, 1)
++	base.ReadAt(chk, 0)
++	if chk[0] != 0xAA {
++		t.Fatalf("base file mutated by decommit: %#x", chk[0])
++	}
++}
+diff --git a/pkg/sentry/state/state.go b/pkg/sentry/state/state.go
+index 199d1d330..f1393515a 100644
+--- a/pkg/sentry/state/state.go
++++ b/pkg/sentry/state/state.go
+@@ -18,6 +18,7 @@ package state
+ import (
+ 	"errors"
+ 	"fmt"
++	"os"
+ 	"io"
+ 	"time"
+ 
+@@ -54,6 +55,11 @@ type SaveOpts struct {
+ 	// PagesFile is non-nil. Otherwise this content is stored in Destination.
+ 	PagesFile stateio.AsyncWriter
+ 
++	// SharedBaseFile, if non-nil, is the base.img output: k.SaveTo exports the
++	// main MemoryFile's shared base into it and saves a delta-only checkpoint
++	// against it (GVISOR-3 C1b).
++	SharedBaseFile *os.File
++
+ 	// Key is used to enable state integrity check.
+ 	Key []byte
+ 
+@@ -157,9 +163,10 @@ func (opts *SaveOpts) Save(ctx context.Context, k *kernel.Kernel, w *watchdog.Wa
+ 	} else {
+ 		opts.Destination = nil
+ 		// Save the kernel.
+-		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership of wc, opts.PagesMetadata, opts.PagesFile
++		err = k.SaveTo(ctx, wc, opts.PagesMetadata, opts.PagesFile, opts.SharedBaseFile, opts.AppMFExcludeCommittedZeroPages, opts.Resume) // transfers ownership
+ 		opts.PagesMetadata = nil
+ 		opts.PagesFile = nil
++		opts.SharedBaseFile = nil
+ 	}
+ 
+ 	t1, _ := CPUTime()
+diff --git a/runsc/boot/controller.go b/runsc/boot/controller.go
+index 2b11ac3c4..b29dad7bf 100644
+--- a/runsc/boot/controller.go
++++ b/runsc/boot/controller.go
+@@ -18,6 +18,7 @@ import (
+ 	"errors"
+ 	"fmt"
+ 	"io"
++	"os"
+ 	"path"
+ 	"strconv"
+ 	"sync"
+@@ -561,6 +562,12 @@ type RestoreOpts struct {
+ 	HaveDeviceFile bool
+ 	Background     bool
+ 
++	// HaveBaseFile indicates a shared base memory image is present at
++	// BaseFileIndex in FilePayload (GVISOR-3 C1); BaseFileBytes is its size.
++	HaveBaseFile  bool
++	BaseFileIndex int
++	BaseFileBytes uint64
++
+ 	// If UseCheckpointGofer is true, the first file in FilePayload is a Unix
+ 	// domain socket connected to a URPC server implementing
+ 	// stateipc.AsyncFileServer and providing checkpoint files. In this case,
+@@ -628,9 +635,20 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error)
+ 	}
+ 	timer.Reached("created MemoryFile")
+ 
++	// GVISOR-3 (C1): release the optional shared base memory image so the main
++	// MemoryFile is restored over it (overlay + delta), if one was provided.
++	var baseFile *os.File
++	if o.HaveBaseFile {
++		bfd, err := o.ReleaseFD(o.BaseFileIndex)
++		if err != nil {
++			return fmt.Errorf("releasing base image FD: %w", err)
++		}
++		baseFile = os.NewFile(uintptr(bfd.Release()), "base-image")
++	}
++
+ 	if o.HavePagesFile {
+ 		// This immediately starts loading the main MemoryFile asynchronously.
+-		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, timer.Fork("PagesFileLoader")) // transfers ownership
++		cm.restorer.asyncMFLoader = kernel.NewAsyncMFLoader(pagesMetadata, pagesFile, cm.restorer.mainMF, baseFile, o.BaseFileBytes, timer.Fork("PagesFileLoader")) // transfers ownership
+ 		pagesMetadata = nil
+ 		pagesFile = nil
+ 		timer.Reached("created async MF loader")
+diff --git a/runsc/cmd/checkpoint.go b/runsc/cmd/checkpoint.go
+index b6419d583..6b7c8e996 100644
+--- a/runsc/cmd/checkpoint.go
++++ b/runsc/cmd/checkpoint.go
+@@ -40,6 +40,7 @@ type Checkpoint struct {
+ 	excludeCommittedZeroPages bool
+ 	cudaCheckpointPath        string
+ 	cudaCheckpointSequential  bool
++	sharedBase                bool
+ 	saveRestoreExecArgv       string
+ 	saveRestoreExecTimeout    time.Duration
+ 
+@@ -75,6 +76,7 @@ func (c *Checkpoint) SetFlags(f *flag.FlagSet) {
+ 	f.BoolVar(&c.direct, "direct", false, "use O_DIRECT for writing checkpoint pages file")
+ 	f.StringVar(&c.cudaCheckpointPath, "cuda-checkpoint-path", "", "path to the cuda-checkpoint binary in the container")
+ 	f.BoolVar(&c.cudaCheckpointSequential, "cuda-checkpoint-sequential", false, "run cuda-checkpoint sequentially in the container")
++	f.BoolVar(&c.sharedBase, "shared-base", false, "produce base.img and a delta-only checkpoint against it (GVISOR-3)")
+ 	f.StringVar(&c.saveRestoreExecArgv, "save-restore-exec-argv", "", "argv (split by spaces) for a save/restore binary that's automatically executed in the sandbox before saving and after restoring. If the execution fails, the save/restore process will fail.")
+ 	f.DurationVar(&c.saveRestoreExecTimeout, "save-restore-exec-timeout", control.DefaultSaveRestoreExecTimeout, "timeout for the binary pointed to by save-restore-exec-argv.")
+ 
+@@ -121,6 +123,7 @@ func (c *Checkpoint) Execute(_ context.Context, f *flag.FlagSet, args ...any) su
+ 		ExcludeCommittedZeroPages:  c.excludeCommittedZeroPages,
+ 		CudaCheckpointPath:         c.cudaCheckpointPath,
+ 		CudaCheckpointSequential:   c.cudaCheckpointSequential,
++		SharedBase:                 c.sharedBase,
+ 		SaveRestoreExecArgv:        c.saveRestoreExecArgv,
+ 		SaveRestoreExecTimeout:     c.saveRestoreExecTimeout,
+ 		SaveRestoreExecContainerID: cont.ID,
+diff --git a/runsc/sandbox/sandbox.go b/runsc/sandbox/sandbox.go
+index d01e58819..6a07047b2 100644
+--- a/runsc/sandbox/sandbox.go
++++ b/runsc/sandbox/sandbox.go
+@@ -635,6 +635,25 @@ func (s *Sandbox) setRestoreOptsForLocalCheckpointFiles(conf *config.Config, ima
+ 	} else {
+ 		log.Infof("Using single checkpoint file for sandbox %q", s.ID)
+ 	}
++
++	// GVISOR-3 (C1): an optional shared base memory image (base.img) in imagePath.
++	// When present, the main MemoryFile is restored over it (MAP_PRIVATE overlay +
++	// delta), so clones from a delta-only checkpoint physically share the base.
++	baseFileName := path.Join(imagePath, "base.img")
++	if bf, err := os.Open(baseFileName); err == nil {
++		fi, ferr := bf.Stat()
++		if ferr != nil {
++			bf.Close()
++			return fmt.Errorf("stat base image %q: %w", baseFileName, ferr)
++		}
++		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
++		opt.HaveBaseFile = true
++		opt.BaseFileIndex = len(opt.FilePayload.Files) - 1
++		opt.BaseFileBytes = uint64(fi.Size())
++		log.Infof("Restoring main MemoryFile over shared base image %q (%d bytes)", baseFileName, fi.Size())
++	} else if !os.IsNotExist(err) {
++		return fmt.Errorf("opening base image %q failed: %w", baseFileName, err)
++	}
+ 	return nil
+ }
+ 
+@@ -1612,6 +1631,7 @@ type CheckpointOpts struct {
+ 	ExcludeCommittedZeroPages bool
+ 	CudaCheckpointPath        string
+ 	CudaCheckpointSequential  bool
++	SharedBase                bool
+ 
+ 	// Save/restore exec options.
+ 	SaveRestoreExecArgv        string
+@@ -1674,6 +1694,17 @@ func setCheckpointOptsFilesForLocalCheckpoint(conf *config.Config, imagePath str
+ 	}
+ 	opt.FilePayload.Files = files
+ 	opt.HavePagesFile = len(files) > 1
++	// GVISOR-3 (C1b): add a base.img output so the sentry exports the shared base
++	// and saves a delta-only checkpoint against it.
++	if opts.SharedBase && opt.HavePagesFile {
++		basePath := filepath.Join(imagePath, "base.img")
++		bf, err := os.OpenFile(basePath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0644)
++		if err != nil {
++			return fmt.Errorf("creating base image %q: %w", basePath, err)
++		}
++		opt.FilePayload.Files = append(opt.FilePayload.Files, bf)
++		opt.SharedBase = true
++	}
+ 	return nil
+ }
+ 
