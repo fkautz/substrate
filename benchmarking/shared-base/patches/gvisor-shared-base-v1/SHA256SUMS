@@ -1,0 +1,5 @@
+c1a3ca8f734f09d6979c7ced62844f9c6ffe28b6bc9f2ce9731e72d58c4a82bb  0000-cover-letter.patch
+befa7b971f0d89d14346ab28406402289719f023ddd61630e4554b6bd6ae87f3  0001-pgalloc-support-copy-on-write-shared-base-mappings.patch
+9c55b315d9f7cff15aa6e05204c7dabdfb88ed7b6335568a7e5def0c481eca29  0002-pgalloc-save-and-restore-memory-as-base-plus-delta.patch
+543130fea7fcf53e361ceeecbadd6ac4ad20149471939d3f9d19b704509315ca  0003-runsc-restore-checkpoints-over-an-optional-shared-ba.patch
+6f1e2c1606561ca195f14aaf7af3ce511ca9cb24f6cd8bc751c70b711fb20a07  0004-runsc-add-shared-base-checkpoint-creation.patch

@@ -1,0 +1,390 @@
+From 23843e0222640005ba2302432d53e26a8db2b781 Mon Sep 17 00:00:00 2001
+From: "Frederick F. Kautz IV" <fkautz@alumni.cmu.edu>
+Date: Mon, 20 Jul 2026 20:29:58 -0700
+Subject: [PATCH 1/4] pgalloc: support copy-on-write shared base mappings
+
+Allow a MemoryFile to overlay an immutable shared base with MAP_PRIVATE mappings. ExportLinearBase captures the committed memory image, and writes remain private to each MemoryFile.
+
+Add coverage for shared reads, copy-on-write isolation, base export, and applying private deltas over a shared base.
+---
+ pkg/sentry/pgalloc/BUILD              |   1 +
+ pkg/sentry/pgalloc/pgalloc.go         |  78 ++++++++
+ pkg/sentry/pgalloc/sharedbase_test.go | 249 ++++++++++++++++++++++++++
+ 3 files changed, 328 insertions(+)
+ create mode 100644 pkg/sentry/pgalloc/sharedbase_test.go
+
+diff --git a/pkg/sentry/pgalloc/BUILD b/pkg/sentry/pgalloc/BUILD
+index 32f5a769c..aefeb736f 100644
+--- a/pkg/sentry/pgalloc/BUILD
++++ b/pkg/sentry/pgalloc/BUILD
+@@ -207,6 +207,7 @@ go_test(
+     srcs = [
+         "pgalloc_64k_test.go",
+         "pgalloc_test.go",
++        "sharedbase_test.go",
+     ],
+     library = ":pgalloc",
+     deps = [
+diff --git a/pkg/sentry/pgalloc/pgalloc.go b/pkg/sentry/pgalloc/pgalloc.go
+index 43d9c4d8f..3e6f03c49 100644
+--- a/pkg/sentry/pgalloc/pgalloc.go
++++ b/pkg/sentry/pgalloc/pgalloc.go
+@@ -384,6 +384,14 @@ type MemoryFileOpts struct {
+ 	// If DisableMemoryAccounting is true, memory usage observed by the
+ 	// MemoryFile will not be reported in usage.MemoryAccounting.
+ 	DisableMemoryAccounting bool
++
++	// SharedBaseFile, if non-nil, backs the chunk range [0, SharedBaseBytes)
++	// with a MAP_PRIVATE mapping of this read-only file: resident base pages
++	// are physically shared across
++	// MemoryFiles using the same file, and writes fault to private copies.
++	// The overlay is established as chunks are extended.
++	SharedBaseFile  *os.File
++	SharedBaseBytes uint64
+ }
+ 
+ // DelayedEvictionType is the type of MemoryFileOpts.DelayedEviction.
+@@ -951,6 +959,34 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
+ 			m += chunkSize
+ 		}
+ 	}
++	// Back base-range chunks with a MAP_PRIVATE mapping of the
++	// shared base file so resident base pages are shared copy-on-write across
++	// MemoryFiles and writes fault to private copies.
++	if f.opts.SharedBaseFile != nil {
++		for i := oldNrChunks; i < newNrChunks; i++ {
++			if newChunks[i].mapping == 0 {
++				continue
++			}
++			// Overlay the [0, SharedBaseBytes) portion of this chunk MAP_PRIVATE from
++			// the shared base file; any remainder stays MAP_SHARED on f.file. This
++			// shares sub-1-GiB bases too, since chunkSize is 1 GiB.
++			off := i * chunkSize
++			hi := off + chunkSize
++			if hi > f.opts.SharedBaseBytes {
++				hi = f.opts.SharedBaseBytes
++			}
++			if off >= hi {
++				continue
++			}
++			if _, _, errno := unix.Syscall6(unix.SYS_MMAP,
++				newChunks[i].mapping, uintptr(hi-off),
++				unix.PROT_READ|unix.PROT_WRITE,
++				unix.MAP_PRIVATE|unix.MAP_FIXED,
++				f.opts.SharedBaseFile.Fd(), uintptr(off)); errno != 0 {
++				return errno
++			}
++		}
++	}
+ 	f.chunks.Store(&newChunks)
+ 
+ 	// Mark void pages free.
+@@ -962,6 +998,48 @@ func (f *MemoryFile) extendChunksLocked(alloc *allocState) error {
+ 	return nil
+ }
+ 
++// ExportLinearBase writes the committed contents of the MemoryFile to out as a
++// sparse, guest-address-linear base image (out offset O == MemoryFile offset O),
++// usable as MemoryFileOpts.SharedBaseFile in other MemoryFiles. The
++// backing memfd is already laid out linearly (chunk i at file offset i*chunkSize),
++// so only its data extents (SEEK_DATA/SEEK_HOLE) are copied and out stays sparse.
++func (f *MemoryFile) ExportLinearBase(out *os.File) (uint64, error) {
++	size := int64(uint64(len(f.chunksLoad())) * chunkSize)
++	if err := out.Truncate(size); err != nil {
++		return 0, err
++	}
++	infd, outfd := int(f.file.Fd()), int(out.Fd())
++	buf := make([]byte, 1<<20)
++	for off := int64(0); off < size; {
++		data, err := unix.Seek(infd, off, unix.SEEK_DATA)
++		if err != nil {
++			break
++		}
++		hole, err := unix.Seek(infd, data, unix.SEEK_HOLE)
++		if err != nil {
++			hole = size
++		}
++		for pos := data; pos < hole; {
++			n := int64(len(buf))
++			if hole-pos < n {
++				n = hole - pos
++			}
++			rn, rerr := unix.Pread(infd, buf[:n], pos)
++			if rn > 0 {
++				if _, werr := unix.Pwrite(outfd, buf[:rn], pos); werr != nil {
++					return 0, werr
++				}
++				pos += int64(rn)
++			}
++			if rerr != nil || rn == 0 {
++				break
++			}
++		}
++		off = hole
++	}
++	return uint64(size), nil
++}
++
+ func (f *MemoryFile) madviseChunkMapping(addr, len uintptr, huge bool) {
+ 	if huge {
+ 		if f.opts.AdviseHugepage {
+diff --git a/pkg/sentry/pgalloc/sharedbase_test.go b/pkg/sentry/pgalloc/sharedbase_test.go
+new file mode 100644
+index 000000000..afd1fe9d6
+--- /dev/null
++++ b/pkg/sentry/pgalloc/sharedbase_test.go
+@@ -0,0 +1,249 @@
++// Copyright 2024 The gVisor Authors.
++// Tests copy-on-write semantics of a shared base file.
++package pgalloc
++
++import (
++	"bytes"
++	"os"
++	"testing"
++
++	"gvisor.dev/gvisor/pkg/hostarch"
++	"gvisor.dev/gvisor/pkg/sentry/memmap"
++)
++
++func TestSharedBaseCOW(t *testing.T) {
++	const baseLen = 4 << 20 // 4 MiB, well under the 1 GiB chunk -> exercises finer mapping
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	pat := make([]byte, baseLen)
++	for i := range pat {
++		pat[i] = byte(i*131 + 7)
++	}
++	if _, err := base.WriteAt(pat, 0); err != nil {
++		t.Fatal(err)
++	}
++
++	mk := func() *MemoryFile {
++		b, err := os.CreateTemp("", "llifs-backing-*")
++		if err != nil {
++			t.Fatal(err)
++		}
++		os.Remove(b.Name())
++		f, err := NewMemoryFile(b, MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: baseLen})
++		if err != nil {
++			t.Fatal(err)
++		}
++		return f
++	}
++	rd := func(f *MemoryFile, fr memmap.FileRange, n int) []byte {
++		bs, err := f.MapInternal(fr, hostarch.Read)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return append([]byte(nil), bs.Head().ToSlice()[:n]...)
++	}
++
++	f1 := mk()
++	defer f1.Destroy()
++	fr1, err := f1.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if fr1.Start >= baseLen {
++		t.Fatalf("allocation landed outside base range: %v", fr1)
++	}
++	if got := rd(f1, fr1, 64); !bytes.Equal(got, pat[fr1.Start:fr1.Start+64]) {
++		t.Fatalf("base-backed read mismatch at off %d: got %x want %x", fr1.Start, got, pat[fr1.Start:fr1.Start+64])
++	}
++
++	f2 := mk()
++	defer f2.Destroy()
++	fr2, err := f2.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := rd(f2, fr2, 64); !bytes.Equal(got, pat[fr2.Start:fr2.Start+64]) {
++		t.Fatalf("second MemoryFile base read mismatch")
++	}
++
++	// Copy-on-write: write through f1; the base file and f2 stay unchanged, f1 sees it.
++	bs, err := f1.MapInternal(fr1, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	want := ^pat[fr1.Start]
++	bs.Head().ToSlice()[0] = want
++	chk := make([]byte, 1)
++	if _, err := base.ReadAt(chk, int64(fr1.Start)); err != nil {
++		t.Fatal(err)
++	}
++	if chk[0] != pat[fr1.Start] {
++		t.Fatalf("base FILE mutated by a private write: %x", chk[0])
++	}
++	if got := rd(f2, fr2, 1); got[0] != pat[fr2.Start] {
++		t.Fatalf("f2 observed f1 private write (no isolation)")
++	}
++	if got := rd(f1, fr1, 1); got[0] != want {
++		t.Fatalf("f1 did not observe its own write: %x", got[0])
++	}
++}
++
++func TestExportLinearBaseAndShare(t *testing.T) {
++	mkMF := func(opts MemoryFileOpts) *MemoryFile {
++		b, err := os.CreateTemp("", "llifs-mf-*")
++		if err != nil {
++			t.Fatal(err)
++		}
++		os.Remove(b.Name())
++		f, err := NewMemoryFile(b, opts)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return f
++	}
++
++	src := mkMF(MemoryFileOpts{})
++	defer src.Destroy()
++	fr, err := src.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	bs, err := src.MapInternal(fr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	pat := make([]byte, 256)
++	for i := range pat {
++		pat[i] = byte(i*7 + 3)
++	}
++	copy(bs.Head().ToSlice(), pat)
++
++	out, err := os.CreateTemp("", "llifs-exported-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(out.Name())
++	defer out.Close()
++	exSize, err := src.ExportLinearBase(out)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if exSize == 0 {
++		t.Fatal("export produced empty size")
++	}
++	chk := make([]byte, len(pat))
++	if _, err := out.ReadAt(chk, int64(fr.Start)); err != nil {
++		t.Fatal(err)
++	}
++	if !bytes.Equal(chk, pat) {
++		t.Fatalf("exported base content mismatch at off %d", fr.Start)
++	}
++
++	// The exported file works as a shared base.
++	dst := mkMF(MemoryFileOpts{SharedBaseFile: out, SharedBaseBytes: exSize})
++	defer dst.Destroy()
++	fr2, err := dst.Allocate(uint64(hostarch.PageSize), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	bs2, err := dst.MapInternal(fr2, hostarch.Read)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if got := bs2.Head().ToSlice()[:len(pat)]; !bytes.Equal(got, pat) {
++		t.Fatalf("shared base from export mismatch at fr2=%v", fr2)
++	}
++}
++
++// TestBasePlusDeltaRestore verifies base-plus-delta composition:
++// map a shared base, then WRITE the per-agent delta pages over it (COW), yielding
++// a base+delta view with isolation -- without touching the base file or peers.
++func TestBasePlusDeltaRestore(t *testing.T) {
++	pg := int(hostarch.PageSize)
++	mkMF := func(opts MemoryFileOpts) *MemoryFile {
++		b, err := os.CreateTemp("", "llifs-mf-*")
++		if err != nil {
++			t.Fatal(err)
++		}
++		os.Remove(b.Name())
++		f, err := NewMemoryFile(b, opts)
++		if err != nil {
++			t.Fatal(err)
++		}
++		return f
++	}
++
++	// Base: page0=0xAA, page1=0xBB.
++	src := mkMF(MemoryFileOpts{})
++	defer src.Destroy()
++	sfr, err := src.Allocate(uint64(2*pg), AllocOpts{Mode: AllocateAndCommit, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	ssl, err := src.MapInternal(sfr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	sb := ssl.Head().ToSlice()
++	sb[0] = 0xAA
++	sb[pg] = 0xBB
++	base, err := os.CreateTemp("", "llifs-base-*")
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer os.Remove(base.Name())
++	defer base.Close()
++	exSize, err := src.ExportLinearBase(base)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// Clone A: map base, then apply a delta (page1 -> 0xCC) by writing over it.
++	a := mkMF(MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: exSize})
++	defer a.Destroy()
++	afr, err := a.Allocate(uint64(2*pg), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	asl, err := a.MapInternal(afr, hostarch.ReadWrite)
++	if err != nil {
++		t.Fatal(err)
++	}
++	ab := asl.Head().ToSlice()
++	if ab[0] != 0xAA || ab[pg] != 0xBB {
++		t.Fatalf("clone A pre-delta should read base: %x %x", ab[0], ab[pg])
++	}
++	ab[pg] = 0xCC // delta apply (COW)
++	if ab[0] != 0xAA || ab[pg] != 0xCC {
++		t.Fatalf("clone A post-delta want AA,CC got %x,%x", ab[0], ab[pg])
++	}
++
++	// Base file must be unchanged by the delta.
++	chk := make([]byte, 1)
++	if _, err := base.ReadAt(chk, int64(sfr.Start)+int64(pg)); err != nil {
++		t.Fatal(err)
++	}
++	if chk[0] != 0xBB {
++		t.Fatalf("base file mutated by clone A delta: %x", chk[0])
++	}
++
++	// Clone B: same base, NO delta -> pure base (page1 still 0xBB), isolated from A.
++	b := mkMF(MemoryFileOpts{SharedBaseFile: base, SharedBaseBytes: exSize})
++	defer b.Destroy()
++	bfr, err := b.Allocate(uint64(2*pg), AllocOpts{Mode: AllocateUncommitted, Dir: BottomUp})
++	if err != nil {
++		t.Fatal(err)
++	}
++	bsl, err := b.MapInternal(bfr, hostarch.Read)
++	if err != nil {
++		t.Fatal(err)
++	}
++	bb := bsl.Head().ToSlice()
++	if bb[0] != 0xAA || bb[pg] != 0xBB {
++		t.Fatalf("clone B (no delta) want AA,BB got %x,%x", bb[0], bb[pg])
++	}
++}
+
+base-commit: 928199eb9fb28593a69ac3daffdba01c3319dc8f
+-- 
+2.50.1 (Apple Git-155)
+

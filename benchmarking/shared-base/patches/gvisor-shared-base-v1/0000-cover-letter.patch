@@ -1,0 +1,94 @@
+From 4644dce207d7130633d5e07d1c09e942f6cb9a4f Mon Sep 17 00:00:00 2001
+From: "Frederick F. Kautz IV" <fkautz@alumni.cmu.edu>
+Date: Mon, 20 Jul 2026 20:35:29 -0700
+Subject: [PATCH 0/4] Share base memory across restored KVM sandboxes
+
+This series lets restored sandboxes compose guest memory from one immutable
+base image plus a private checkpoint delta. Multiple KVM sandboxes map the
+same clean base pages MAP_PRIVATE, so the host page cache shares them until a
+sandbox writes and receives its own copy-on-write page.
+
+The save side compares committed pages with the base, records matching ranges
+in checkpoint metadata, and omits those pages from the packed pages file. The
+load side overlays the base before applying the remaining delta. Save and load
+use the same walk order and skip set. In particular, a zero page over a
+non-zero base page remains a real delta and is not omitted.
+
+The runsc plumbing is opt-in. `checkpoint --shared-base` writes base.img and a
+delta-only checkpoint. Restore discovers an optional base.img beside local
+checkpoint files. Without the flag or base file, existing checkpoint and
+restore behavior is unchanged.
+
+Platform boundary
+=================
+
+This memory-sharing mechanism is correct for the KVM platform, where guest
+execution consumes the sentry's composed MemoryFile mapping. It does not
+provide shared-base memory on systrap: the systrap stub maps the per-sandbox
+memfd separately and cannot see the sentry's MAP_PRIVATE overlay. Ordinary
+checkpoint/restore remains unaffected on systrap.
+
+Security boundary
+=================
+
+This series assumes base.img is an authenticated, immutable input. Fetching,
+content verification, caching, and sealing belong to the node or orchestration
+layer before runsc receives the file descriptor; no external verification
+dependency is added to gVisor.
+
+Results and validation
+======================
+
+The experiment suite was run on Linux/KVM using gVisor at base commit
+928199eb9fb28593a69ac3daffdba01c3319dc8f:
+
+  * pgalloc base/delta tests passed through synchronous and asynchronous load;
+  * controlled tests measured 4.9x to 15x Rss/Pss flatten;
+  * eight live KVM sandboxes over a 256 MiB base measured 5.69x flatten;
+  * a Python ADK workload restored correctly and measured 2.9x flatten over an
+    80 MiB resident base, limited by about 20 MiB of per-sandbox overhead.
+
+The reconstructed four-commit series is tree-identical to the combined patch
+used for those runs. `git diff --check` passes. A local Darwin Bazel build
+cannot validate the Linux-only target: unchanged gVisor code fails while
+compiling pkg/sentry/usage because memutil.CreateMemFD is unavailable on
+Darwin. Re-run `bazel test //pkg/sentry/pgalloc:pgalloc_test` on Linux before
+applying the series in production.
+
+Repeated restore-dirty-checkpoint generations have not yet been exercised end
+to end. The checkpoint-after-restore composition is covered at the MemoryFile
+layer, but should receive a live KVM lifecycle test.
+
+Background and reproduction harness:
+https://zt.dev/posts/gvisor-shared-memory-snapshot-restore/
+
+Assisted-by: OpenAI Codex
+
+Frederick F. Kautz IV (4):
+  pgalloc: support copy-on-write shared base mappings
+  pgalloc: save and restore memory as base plus delta
+  runsc: restore checkpoints over an optional shared base
+  runsc: add shared-base checkpoint creation
+
+ pkg/sentry/control/state.go            |  15 +
+ pkg/sentry/kernel/kernel.go            |  21 +-
+ pkg/sentry/kernel/kernel_restore.go    |  17 +-
+ pkg/sentry/pgalloc/BUILD               |   6 +
+ pkg/sentry/pgalloc/flatten_test.go     | 144 ++++++++
+ pkg/sentry/pgalloc/pgalloc.go          | 158 +++++++++
+ pkg/sentry/pgalloc/save_restore.go     | 242 ++++++++++---
+ pkg/sentry/pgalloc/saverestore_test.go | 459 +++++++++++++++++++++++++
+ pkg/sentry/pgalloc/sharedbase_test.go  | 389 +++++++++++++++++++++
+ pkg/sentry/state/state.go              |   9 +-
+ runsc/boot/controller.go               |  20 +-
+ runsc/cmd/checkpoint.go                |   3 +
+ runsc/sandbox/sandbox.go               |  31 ++
+ 13 files changed, 1452 insertions(+), 62 deletions(-)
+ create mode 100644 pkg/sentry/pgalloc/flatten_test.go
+ create mode 100644 pkg/sentry/pgalloc/saverestore_test.go
+ create mode 100644 pkg/sentry/pgalloc/sharedbase_test.go
+
+
+base-commit: 928199eb9fb28593a69ac3daffdba01c3319dc8f
+-- 
+2.50.1 (Apple Git-155)

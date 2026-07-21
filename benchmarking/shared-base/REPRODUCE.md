@@ -32,7 +32,10 @@ aarch64 cross-gcc for the VDSO genrule.)
 ## 3. Build patched gVisor
 
 ```
-# Apply the separately released four-patch shared-base series to gVisor 928199eb9.
+git clone https://github.com/google/gvisor.git gvisor-shared-base
+cd gvisor-shared-base
+git checkout 928199eb9
+git am <substrate-checkout>/benchmarking/shared-base/patches/gvisor-shared-base-v1/000[1-4]-*.patch
 bazel build --jobs=4 --local_resources=memory=12000 //runsc:runsc
 bazel test //pkg/sentry/pgalloc:pgalloc_test   # the in-tree base/delta tests
 ```
@@ -72,7 +75,7 @@ Environment of record: GCE `n2-standard-4`, Ubuntu 24.04, nested virtualization;
 
 - `../gvisor3-s1.pgalloc.patch`, `../c1-restore-plumbing.patch`, and
   `../c1b-checkpoint-plumbing.patch` are experimental development records. They overlap and are not
-  the release series; use the separately published four-patch gVisor series for reproduction.
+  the release series; use `patches/gvisor-shared-base-v1/` for reproduction.
 - `../sharedbase_test.go`, `../saverestore_test.go`, `../flatten_test.go` -- the in-tree pgalloc
   tests (also contained in the combined patch).
 - `../density_smoke.c` -- the standalone Linux `MAP_PRIVATE` copy-on-write smoke test (§ "does the
