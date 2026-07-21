@@ -1,7 +1,10 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# Setup: Build the instrumented Python/google-adk image and export it as the OCI bundle used by the ADK tests.
+# Why: Pinning bundle construction beside the runners makes the real-workload measurements reproducible.
+# Output: $H/adkbundle and $H/buildimg.done. This is setup, not a measurement.
 set -e
-H=/home/fkautz
-R=$H/gvisor/bazel-bin/runsc/runsc_/runsc
+H=${H:-/home/fkautz}
+R=${RUNSC:-$H/gvisor/bazel-bin/runsc/runsc_/runsc}
 rm -f $H/buildimg.done
 rm -rf $H/adkimg $H/adkbundle
 mkdir -p $H/adkimg $H/adkbundle/rootfs

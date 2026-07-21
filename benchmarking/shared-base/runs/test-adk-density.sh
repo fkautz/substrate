@@ -1,7 +1,10 @@
-#!/bin/bash
-H=/home/fkautz
-R=$H/gvisor/bazel-bin/runsc/runsc_/runsc
-B=$H/adkbundle
+#!/usr/bin/env bash
+# Test: Restore eight warm Python/google-adk agents from one KVM shared-base checkpoint and compare aggregate RSS with PSS.
+# Why: This measures density on the real agent stack, including the irreducible per-sandbox runtime floor.
+# Output: $H/adkexp.txt
+H=${H:-/home/fkautz}
+R=${RUNSC:-$H/gvisor/bazel-bin/runsc/runsc_/runsc}
+B=${BUNDLE:-$H/adkbundle}
 D=$H/adkck; rm -rf $D $H/a*.log; mkdir -p $D/ckpt
 pkill -f "runsc-sandbox" 2>/dev/null; sleep 2
 ROOT="--root /run/adk2 --platform=kvm --ignore-cgroups --network=none"

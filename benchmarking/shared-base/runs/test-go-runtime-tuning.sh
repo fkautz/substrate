@@ -1,7 +1,10 @@
-#!/bin/bash
-H=/home/fkautz
-R=$H/gvisor/bazel-bin/runsc/runsc_/runsc
-B=$H/c1test/bundle
+#!/usr/bin/env bash
+# Test: Run the same small KVM sandbox under four GOGC/GOMEMLIMIT configurations and measure sentry private memory.
+# Why: This checks whether the density floor is reclaimable Go heap or structural runtime state.
+# Output: $H/gotune.txt
+H=${H:-/home/fkautz}
+R=${RUNSC:-$H/gvisor/bazel-bin/runsc/runsc_/runsc}
+B=${BUNDLE:-$H/c1test/bundle}
 sed -i "s/WARM_MB=[0-9]*/WARM_MB=4/" $B/config.json
 > $H/gotune.txt
 sentry_priv(){ awk "/^Pss:/{pss=\$2}/^Private_Dirty:/{pd=\$2}/^Private_Clean:/{pc=\$2}/^Anonymous:/{an=\$2}END{printf \"Pss=%dM Anon(Go)=%dM Priv(marginal)=%dM\", pss/1024,an/1024,(pd+pc)/1024}" /proc/$1/smaps_rollup 2>/dev/null; }

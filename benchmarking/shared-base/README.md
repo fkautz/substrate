@@ -1,15 +1,16 @@
-# shared-base: benchmark code for the LLIFS density + latency results
+# shared-base: benchmark code for the density and latency results
 
 This directory holds everything needed to reproduce the shared-copy-on-write-base
-(LLIFS GVISOR-3) results reported in `docs/blog-shared-base-memory.md` and
-`../density-prototype-findings.md`: the gVisor change, the reproduction ladder, the
+results reported in `../density-prototype-findings.md`: the gVisor change, the reproduction ladder, the
 orchestration scripts, and the agent workload.
 
 - **`REPRODUCE.md`** -- the full ladder: host, toolchain, build, run, expected numbers.
+- **`prepare-gvisor.sh`** -- clones the pinned upstream gVisor revision, verifies the patch
+  checksums, and applies the four-patch series in order.
 - **`patches/gvisor-shared-base-v1/`** -- a four-part `git format-patch` series against gVisor
   `928199eb9`, with a cover letter and SHA-256 checksums.
-- **`runs/`** -- the exact orchestration scripts used on the KVM host (one per experiment; see the
-  table in REPRODUCE.md for which script produced which finding).
+- **`runs/`** -- one self-contained runner per measurement. Every runner begins with `Test:`,
+  `Why:`, and `Output:` comments; see the table in REPRODUCE.md.
 - **`agent/`** -- the real workload: a google-adk 2.3.0 Python agent with the LLM endpoint mocked
   (`agent.py` instrumented for the correctness/latency runs, `agent-basic.py` minimal),
   plus the `Dockerfile` used to build its rootfs.

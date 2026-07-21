@@ -1,6 +1,9 @@
-#!/bin/bash
-H=/home/fkautz
-R=$H/gvisor/bazel-bin/runsc/runsc_/runsc; B=$H/c1test/bundle
+#!/usr/bin/env bash
+# Test: Count sentry/gofer OS threads and report their memory dimensions for one small KVM sandbox.
+# Why: This explains the structural process/thread component of the per-clone memory floor.
+# Output: $H/thr.txt
+H=${H:-/home/fkautz}
+R=${RUNSC:-$H/gvisor/bazel-bin/runsc/runsc_/runsc}; B=${BUNDLE:-$H/c1test/bundle}
 pkill -f runsc-sandbox 2>/dev/null; sleep 1
 ROOT="--root /run/gr --platform=kvm --ignore-cgroups --network=none"
 $R $ROOT run -bundle $B gr > $H/gr.log 2>&1 & sleep 6

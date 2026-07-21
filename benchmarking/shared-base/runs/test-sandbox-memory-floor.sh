@@ -1,7 +1,10 @@
-#!/bin/bash
-H=/home/fkautz
-R=$H/gvisor/bazel-bin/runsc/runsc_/runsc
-B=$H/c1test/bundle
+#!/usr/bin/env bash
+# Test: Measure sentry and gofer PSS/RSS and classify anonymous versus file-backed memory for one small KVM sandbox.
+# Why: This identifies the per-sandbox memory floor that shared guest pages cannot eliminate.
+# Output: $H/gomem.txt
+H=${H:-/home/fkautz}
+R=${RUNSC:-$H/gvisor/bazel-bin/runsc/runsc_/runsc}
+B=${BUNDLE:-$H/c1test/bundle}
 pkill -f runsc-sandbox 2>/dev/null; sleep 1
 sed -i "s/WARM_MB=[0-9]*/WARM_MB=4/" $B/config.json
 ROOT="--root /run/gomem --platform=kvm --ignore-cgroups --network=none"

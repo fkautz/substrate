@@ -1,7 +1,10 @@
-#!/bin/bash
-H=/home/fkautz
-R=$H/gvisor/bazel-bin/runsc/runsc_/runsc
-B=$H/adkbundle
+#!/usr/bin/env bash
+# Test: Pad an ADK process with 1 GiB of allocated-but-cold memory, then compare RSS/PSS at 8 and 16 restored clones.
+# Why: This separates virtual allocation size from resident working set and shows that untouched padding does not consume proportional RAM.
+# Output: $H/adkexp2.txt
+H=${H:-/home/fkautz}
+R=${RUNSC:-$H/gvisor/bazel-bin/runsc/runsc_/runsc}
+B=${BUNDLE:-$H/adkbundle}
 D=$H/adkck2; rm -rf $D $H/b*.log; mkdir -p $D/ckpt
 pkill -f "runsc-sandbox" 2>/dev/null; sleep 2
 # pad the agent warm base to ~1 GiB (simulate a large loaded working set)

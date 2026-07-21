@@ -1,7 +1,10 @@
-#!/bin/bash
-H=/home/fkautz
-R=$H/gvisor/bazel-bin/runsc/runsc_/runsc
-B=$H/c1test/bundle; D=$H/c1b2; rm -rf $D; mkdir -p $D/ckpt
+#!/usr/bin/env bash
+# Test: Restore eight live KVM sandboxes from a 256 MiB touch-all shared-base checkpoint and compare aggregate RSS with PSS.
+# Why: This is the direct end-to-end proof that patched runsc preserves host copy-on-write sharing across independent clones.
+# Output: $H/flatten_result.txt
+H=${H:-/home/fkautz}
+R=${RUNSC:-$H/gvisor/bazel-bin/runsc/runsc_/runsc}
+B=${BUNDLE:-$H/c1test/bundle}; D=$H/c1b2; rm -rf $D; mkdir -p $D/ckpt
 pkill -f runsc-sandbox 2>/dev/null; sleep 1
 grep -q "p += 64" $H/cr_workload.c && sed -i "s/p += 64/p += 1/g" $H/cr_workload.c
 gcc -O2 -static -o $B/rootfs/cr $H/cr_workload.c

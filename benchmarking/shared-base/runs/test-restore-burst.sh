@@ -1,9 +1,21 @@
-#!/bin/bash
-H=/home/fkautz
-R=$H/gvisor/bazel-bin/runsc/runsc_/runsc
-B=$H/adkbundle
-D=$H/expA/ckpt
+#!/usr/bin/env bash
+# Test: Launch bursts of 50 and 100 concurrent restores and report time-to-first-service p50, p99, and maximum.
+# Why: This reveals restore throughput and CPU contention under scheduler-scale activation bursts.
+# Output: $H/resultB.txt
+H=${H:-/home/fkautz}
+R=${RUNSC:-$H/gvisor/bazel-bin/runsc/runsc_/runsc}
+B=${BUNDLE:-$H/adkbundle}
+D=$H/restore-burst/ckpt
 ROOT="--root /run/expB --platform=kvm --ignore-cgroups --network=none"
+rm -rf "$H/restore-burst"
+mkdir -p "$D"
+pkill -9 -f "runsc-sandbox.*root=/run/expB" 2>/dev/null
+$R $ROOT run -bundle $B burst-seed > "$H/burst-seed.log" 2>&1 &
+until grep -q "tick=" "$H/burst-seed.log" 2>/dev/null; do sleep 0.05; done
+sleep 8
+$R $ROOT checkpoint --shared-base --image-path=$D burst-seed >/dev/null 2>&1
+$R $ROOT delete --force burst-seed 2>/dev/null
+sleep 2
 > $H/resultB.txt
 burst(){
   local N=$1

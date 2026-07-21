@@ -1,6 +1,9 @@
-#!/bin/bash
-H=/home/fkautz
-R=$H/gvisor/bazel-bin/runsc/runsc_/runsc
+#!/usr/bin/env bash
+# Test: Restore progressively larger KVM clone populations (32 through 600) until host memory headroom reaches 1.2 GiB.
+# Why: This finds the practical sandbox density ceiling rather than extrapolating from a small clone count.
+# Output: $H/ceiling.txt
+H=${H:-/home/fkautz}
+R=${RUNSC:-$H/gvisor/bazel-bin/runsc/runsc_/runsc}
 B=$H/c1test/bundle; D=$H/c1c; rm -rf $D $H/a*.log; mkdir -p $D/ckpt
 pkill -f runsc-sandbox 2>/dev/null; sleep 2
 grep -q "p += 1" $H/cr_workload.c && sed -i "s/p += 1/p += 64/g" $H/cr_workload.c
