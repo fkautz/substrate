@@ -115,6 +115,27 @@ service Control {
   rpc DeleteActorTemplateVersion(DeleteActorTemplateVersionRequest) returns (ActorTemplateVersion) {}
 }
 
+// StateRootSnapshotInfo references a snapshot by its LLIFS State Root
+// identifier.
+//
+// A snapshot that IS a State Root MUST be referenced this way (LLIFS CP-1);
+// latest_snapshot (ObjectRef) and local_snapshot_info remain valid for OPAQUE
+// snapshots during migration. The two are not interchangeable: an opaque
+// reference names bytes whose structure nothing has committed to, while a State
+// Root identifier names a canonical LLSR1 object from which every plane is
+// directly resolvable. Referencing a State Root snapshot through the legacy
+// path loses that, and nothing downstream can recover it.
+message StateRootSnapshotInfo {
+  // The canonical Terrapin identifier of the LLSR1 State Root object: exactly
+  // 32 bytes.
+  //
+  // It is BYTES rather than a hex string deliberately. LLIFS identity is
+  // byte-exact throughout, and a string form would introduce a canonicalization
+  // question - upper or lower case, prefixed or bare - that CP-1 does not
+  // answer, leaving two spellings of one identity.
+  bytes state_root_id = 1;
+}
+
 message LocalSnapshotInfo {
   // The name of the local checkpoint on each of the nodes below.
   string snapshot_name = 1;
@@ -254,6 +275,10 @@ message Actor {
   // the Actor was not created from a snapshot. Set once at creation and
   // immutable afterward.
   ActorSnapshotSource source_snapshot = 14;
+
+  // The LLIFS State Root that latest_snapshot resolves to, when that snapshot
+  // is a State Root. Unset for opaque snapshots during migration (LLIFS CP-1).
+  StateRootSnapshotInfo state_root_snapshot_info = 15;
 }
 
 // WorkerAssignment identifies the Worker currently hosting an Actor.
